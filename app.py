@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ✅ MoviePy v2 imports (IMPORTANT)
 from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
-from moviepy.audio.fx import speedx
+from moviepy.audio.fx.speedx import speedx
 
 # ===============================
 # CONFIG
@@ -189,3 +189,4 @@ if st.button("Generate Final MP4 Reel"):
     st.success("Final MP4 ready (audio + captions perfectly synced)")
     st.video(str(out))
     st.download_button("Download MP4", open(out, "rb"), "reel.mp4")
+
