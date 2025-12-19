@@ -38,9 +38,68 @@ PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
 IMAGES_PER_SCENE = 2  # fixed
 
 # ===============================
+# UTIL: JSON FILES
+# ===============================
+def load_json_file(path: Path, default):
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+    return default
+
+def save_json_file(path: Path, obj):
+    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+# ===============================
+# CACHE: PEXELS
+# ===============================
+PEXELS_CACHE = load_json_file(CACHE_FILE, {})
+
+# ===============================
+# TOPIC HISTORY
+# ===============================
+def load_topic_history():
+    data = load_json_file(TOPIC_HISTORY_FILE, {"topics": []})
+    topics = data.get("topics", [])
+    norm = []
+    seen = set()
+    for t in topics:
+        t2 = (t or "").strip()
+        if not t2:
+            continue
+        k = t2.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        norm.append(t2)
+    return norm
+
+def save_topic_history(topics_list):
+    save_json_file(TOPIC_HISTORY_FILE, {"topics": topics_list, "updated_at": datetime.utcnow().isoformat()})
+
+TOPIC_HISTORY = load_topic_history()
+
+def remember_topics(topics):
+    global TOPIC_HISTORY
+    cur = TOPIC_HISTORY[:]
+    s = set(t.lower() for t in cur)
+    for t in topics:
+        t2 = (t or "").strip()
+        if not t2:
+            continue
+        k = t2.lower()
+        if k in s:
+            continue
+        cur.append(t2)
+        s.add(k)
+    TOPIC_HISTORY = cur
+    save_topic_history(TOPIC_HISTORY)
+
+# ===============================
 # UI
 # ===============================
-st.title("YouTube Reel Generator — Batch Mode + Auto-Topics (No duplicates)")
+st.title("YouTube Reel Generator — Batch + Auto Topics (No duplicates)")
 
 mode = st.radio("Mode", ["Single Reel", "Batch (20 Reels)"], horizontal=True)
 
@@ -55,9 +114,7 @@ CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 
 crossfade_seconds = st.slider("Crossfade seconds", 0.2, 1.2, 0.7)
 
-# Pexels throttle
 pexels_delay = st.slider("Delay between Pexels calls (seconds)", 0.0, 1.5, 0.25)
-
 DEBUG = st.toggle("Show debug", False)
 
 # ===============================
@@ -76,44 +133,6 @@ def load_font(size):
     return ImageFont.load_default()
 
 FONT = load_font(CAPTION_FONT_SIZE)
-
-# ===============================
-# CACHE (Pexels results -> local image files)
-# ===============================
-def load_json_file(path: Path, default):
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return default
-    return default
-
-def save_json_file(path: Path, obj):
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
-
-PEXELS_CACHE = load_json_file(CACHE_FILE, {})
-
-def load_topic_history():
-    data = load_json_file(TOPIC_HISTORY_FILE, {"topics": []})
-    topics = data.get("topics", [])
-    # normalize + unique
-    norm = []
-    seen = set()
-    for t in topics:
-        t2 = (t or "").strip()
-        if not t2:
-            continue
-        k = t2.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        norm.append(t2)
-    return norm
-
-def save_topic_history(topics_list):
-    save_json_file(TOPIC_HISTORY_FILE, {"topics": topics_list, "updated_at": datetime.utcnow().isoformat()})
-
-TOPIC_HISTORY = load_topic_history()
 
 # ===============================
 # CAPTION BURN (PIL)
@@ -143,7 +162,7 @@ def burn_caption(img, caption):
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 # ===============================
-# Helpers
+# HELPERS
 # ===============================
 def slugify(s: str) -> str:
     s = s.lower().strip()
@@ -354,20 +373,20 @@ def build_one_reel(topic: str, index: int):
 # ===============================
 PILLARS = {
     "Physics": [
-        "light", "shadow", "heat", "sound", "electricity", "motion", "pressure", "gravity",
-        "friction", "waves", "reflection", "refraction"
+        "fire", "shadow", "heat", "sound", "electricity", "motion", "pressure", "gravity",
+        "friction", "waves", "reflection", "refraction", "light", "static electricity"
     ],
     "Chemistry": [
         "water", "salt", "soap", "oil", "rust", "bubbles", "glass", "ice", "sugar",
-        "coffee", "vinegar", "baking soda"
+        "coffee", "vinegar", "baking soda", "alcohol", "oxygen"
     ],
     "Biology": [
         "sleep", "yawning", "heartbeat", "muscles", "brain", "eyes", "smell", "taste",
-        "skin", "sweat", "goosebumps", "hiccups"
+        "skin", "sweat", "goosebumps", "hiccups", "dandruff", "hair"
     ],
     "Space": [
         "moon", "stars", "black holes", "planets", "sun", "comets", "aurora",
-        "gravity in space", "time", "meteorites", "galaxies", "satellites"
+        "time dilation", "meteorites", "galaxies", "satellites", "gravity in space"
     ],
     "Mind": [
         "paradox", "illusion", "probability", "memory", "attention", "habit",
@@ -387,10 +406,8 @@ def make_candidates():
     for pillar, words in PILLARS.items():
         for w in words:
             for tpl in TEMPLATES:
-                q = tpl.format(x=w)
-                # keep short-ish
-                q = q.replace("  ", " ").strip()
-                if len(q) <= 60:
+                q = tpl.format(x=w).strip()
+                if len(q) <= 70:
                     candidates.append(q)
     return candidates
 
@@ -398,7 +415,8 @@ ALL_CANDIDATES = make_candidates()
 
 def generate_new_topics(n=20):
     used = set(t.lower() for t in TOPIC_HISTORY)
-    # daily shuffle changes each day
+
+    # daily shuffle so each day changes
     seed = int(datetime.utcnow().strftime("%Y%m%d"))
     rng = random.Random(seed + random.randint(0, 10_000_000))
 
@@ -417,21 +435,9 @@ def generate_new_topics(n=20):
 
     return out
 
-def remember_topics(topics):
-    global TOPIC_HISTORY
-    cur = TOPIC_HISTORY[:]
-    s = set(t.lower() for t in cur)
-    for t in topics:
-        t2 = (t or "").strip()
-        if not t2:
-            continue
-        k = t2.lower()
-        if k in s:
-            continue
-        cur.append(t2)
-        s.add(k)
-    TOPIC_HISTORY = cur
-    save_topic_history(TOPIC_HISTORY)
+# Ensure the text area is always controlled by session_state
+if "topics_text" not in st.session_state:
+    st.session_state["topics_text"] = ""
 
 # ===============================
 # UI: Single or Batch
@@ -450,45 +456,39 @@ else:
     col1, col2 = st.columns([2, 1], vertical_alignment="top")
 
     with col1:
-        topics_text = st.text_area(
+        st.text_area(
             "Topics (one per line) — use Auto-generate to fill",
-            value="",
+            key="topics_text",
             height=320,
             placeholder="Click Auto-generate 20 new topics…"
         )
 
     with col2:
         st.subheader("Auto topics")
+
         if st.button("Auto-generate 20 NEW topics"):
             new_topics = generate_new_topics(20)
             if not new_topics:
                 st.error("No new topics left in the pool (increase pool or clear history).")
             else:
-                # remember immediately so next click doesn't repeat
-                remember_topics(new_topics)
-                st.session_state["topics_text_autofill"] = "\n".join(new_topics)
-                st.rerun()
+                remember_topics(new_topics)  # prevent repeats next time
+                st.session_state["topics_text"] = "\n".join(new_topics)
 
         if st.button("Clear topic history (start over)"):
             save_topic_history([])
-            st.session_state["topics_text_autofill"] = ""
-            st.rerun()
+            TOPIC_HISTORY = load_topic_history()
+            st.session_state["topics_text"] = ""
 
         st.caption(f"Remembered topics: {len(TOPIC_HISTORY)}")
 
-    # apply autofill into textbox (safe)
-    if "topics_text_autofill" in st.session_state and st.session_state["topics_text_autofill"]:
-        topics_text = st.session_state["topics_text_autofill"]
-
     if st.button("Generate Batch (up to 20 Reels)"):
-        topics = [t.strip() for t in topics_text.splitlines() if t.strip()]
+        topics = [t.strip() for t in st.session_state.get("topics_text", "").splitlines() if t.strip()]
         topics = topics[:20]
 
         if not topics:
             st.error("Add topics or click Auto-generate first.")
             st.stop()
 
-        # Remember them (prevents repeats next time)
         remember_topics(topics)
 
         prog = st.progress(0)
