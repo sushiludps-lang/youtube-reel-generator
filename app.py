@@ -1,9 +1,20 @@
+# app.py
+# Streamlit Cloud + local compatible
+# Features added:
+# - Generate 20 non-overlapping topics (persisted to cache/latest_topics.json)
+# - Dropdown Reel 1..20
+# - Batch mode: choose how many reels to build (1..20) and auto-build scripts + videos
+# - Per-reel % + ETA + overall % + overall ETA
+# - Save topic/script/video to cache/reels_db.json
+# - Download single MP4 or download ALL as ZIP
+
 import json
 import os
 import re
 import time
+import zipfile
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
 import requests
@@ -11,20 +22,35 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# MoviePy v1.0.3 stable import (Streamlit Cloud safe)
-from moviepy.editor import (
-    ImageClip,
-    AudioFileClip,
-    CompositeVideoClip,
-    concatenate_videoclips,
-    concatenate_audioclips,
-    AudioClip,
-    vfx,
-)
+# -------------------------
+# MoviePy import shim
+# (Works if moviepy==1.x or 2.x)
+# -------------------------
+try:
+    from moviepy.editor import (  # type: ignore
+        ImageClip,
+        AudioFileClip,
+        CompositeVideoClip,
+        concatenate_videoclips,
+        concatenate_audioclips,
+        AudioClip,
+        vfx,
+    )
+except Exception:
+    from moviepy import (  # type: ignore
+        ImageClip,
+        AudioFileClip,
+        CompositeVideoClip,
+        concatenate_videoclips,
+        concatenate_audioclips,
+        AudioClip,
+        vfx,
+    )
 
 # FFmpeg path for Streamlit Cloud
 try:
     import imageio_ffmpeg
+
     os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     pass
@@ -32,6 +58,12 @@ except Exception:
 # Google GenAI SDK
 from google import genai
 from google.genai import types
+
+# =========================
+# Page config (must be first Streamlit call)
+# =========================
+st.set_page_config(page_title="Reel Factory", layout="wide")
+st.title("Reel Factory — Gemini Script + Pexels Images + Subtitle Overlay")
 
 # =========================
 # Paths / Storage
@@ -46,17 +78,24 @@ for d in (IMG_DIR, AUD_DIR, VID_DIR, CACHE_DIR):
     d.mkdir(exist_ok=True)
 
 TOPIC_HISTORY_FILE = CACHE_DIR / "topics_history.json"
+LATEST_TOPICS_FILE = CACHE_DIR / "latest_topics.json"
 REELS_DB_FILE = CACHE_DIR / "reels_db.json"
-LATEST_TOPICS_FILE = CACHE_DIR / "latest_topics.json"  # NEW
 
 # =========================
 # Secrets
 # =========================
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
+PEXELS_API_KEY = st.secrets.get("PEXELS_API_KEY", "")
+
+if not GEMINI_API_KEY:
+    st.error("Missing GEMINI_API_KEY in Streamlit Secrets.")
+    st.stop()
+
+if not PEXELS_API_KEY:
+    st.error("Missing PEXELS_API_KEY in Streamlit Secrets.")
+    st.stop()
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-
 TEXT_MODEL = "models/gemini-2.5-flash"
 
 # =========================
@@ -66,7 +105,7 @@ W, H = 1080, 1920
 FPS = 30
 SCENE_SECONDS = 10
 IMAGES_PER_SCENE = 2
-IMG_SECONDS = SCENE_SECONDS / IMAGES_PER_SCENE  # 5s each
+IMG_SECONDS = SCENE_SECONDS / IMAGES_PER_SCENE  # 5 sec each
 CROSSFADE = 0.6  # smooth crossfade (no black gap)
 AUDIO_FPS = 44100
 
@@ -78,7 +117,18 @@ SUB_BOX_PAD_Y = 36
 SUB_BOX_RADIUS = 36
 
 # =========================
-# Utilities
+# Session state (define BEFORE widgets to avoid StreamlitAPIException)
+# =========================
+st.session_state.setdefault("topics_20", [])
+st.session_state.setdefault("selected_topic", "")
+st.session_state.setdefault("scenes", 6)
+st.session_state.setdefault("batch_count", 5)
+st.session_state.setdefault("batch_only_missing", True)
+st.session_state.setdefault("last_build_zip_path", "")
+st.session_state.setdefault("last_single_mp4", "")
+
+# =========================
+# Helpers
 # =========================
 def slugify(t: str) -> str:
     t = (t or "").lower().strip()
@@ -108,7 +158,24 @@ def load_latest_topics() -> List[str]:
 def save_latest_topics(topics: List[str]):
     save_json(LATEST_TOPICS_FILE, topics)
 
-def pexels_search(query: str, per_page: int = 20) -> List[Dict[str, Any]]:
+def safe_json_loads(raw: str) -> Dict[str, Any]:
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("Empty model output.")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Try to extract JSON between first { and last }
+        s = raw.find("{")
+        e = raw.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            return json.loads(raw[s : e + 1])
+        raise
+
+# =========================
+# Pexels
+# =========================
+def pexels_search(query: str, per_page: int = 30) -> List[Dict[str, Any]]:
     r = requests.get(
         "https://api.pexels.com/v1/search",
         headers={"Authorization": PEXELS_API_KEY},
@@ -135,12 +202,12 @@ def make_placeholder(out_path: Path, text: str) -> Path:
     draw = ImageDraw.Draw(img)
     font = ImageFont.load_default()
     draw.text((60, 80), "PLACEHOLDER", fill=(220, 220, 220), font=font)
-    draw.text((60, 140), text[:220], fill=(230, 230, 230), font=font)
+    draw.text((60, 140), text[:240], fill=(230, 230, 230), font=font)
     img.save(out_path, quality=95)
     return out_path
 
 # =========================
-# Subtitles as overlay frames (NOT burned onto images)
+# Subtitles overlay PNG
 # =========================
 def load_font(size: int) -> ImageFont.FreeTypeFont:
     candidates = [
@@ -173,19 +240,13 @@ def wrap_lines(text: str, max_chars: int = 28) -> List[str]:
         lines.append(" ".join(cur))
     return lines[:2] or [""]
 
-def rounded_rect(draw: ImageDraw.ImageDraw, xy, radius, fill):
-    draw.rounded_rectangle(xy, radius=radius, fill=fill)
-
 def make_subtitle_png(text: str, out_path: Path) -> Path:
-    # Transparent subtitle layer
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-
     lines = wrap_lines(text, max_chars=28)
-    # Measure
+
     spacing = 10
-    widths = []
-    heights = []
+    widths, heights = [], []
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=SUB_FONT)
         widths.append(bbox[2] - bbox[0])
@@ -202,10 +263,9 @@ def make_subtitle_png(text: str, out_path: Path) -> Path:
     y1 = y2 - box_h
     x2 = x1 + box_w
 
-    # Dark box
-    rounded_rect(draw, (x1, y1, x2, y2), SUB_BOX_RADIUS, fill=(10, 10, 12, 220))
+    # rounded box
+    draw.rounded_rectangle((x1, y1, x2, y2), radius=SUB_BOX_RADIUS, fill=(10, 10, 12, 220))
 
-    # Draw lines centered
     y = y1 + SUB_BOX_PAD_Y
     for i, line in enumerate(lines):
         bbox = draw.textbbox((0, 0), line, font=SUB_FONT)
@@ -218,11 +278,11 @@ def make_subtitle_png(text: str, out_path: Path) -> Path:
     return out_path
 
 # =========================
-# Audio: per scene -> exactly 10s
+# Audio: exactly 10s per scene
 # =========================
 def silence_audio(duration: float) -> AudioClip:
     def make_frame(t):
-        return np.zeros((1,), dtype=np.float32)  # mono silence
+        return np.zeros((1,), dtype=np.float32)
     return AudioClip(make_frame, duration=duration, fps=AUDIO_FPS)
 
 def fit_audio_to_duration(audio: AudioFileClip, duration: float) -> AudioClip:
@@ -239,7 +299,7 @@ def make_scene_audio(scene_text: str, out_mp3: Path, duration: float) -> AudioCl
     return fit_audio_to_duration(a, duration)
 
 # =========================
-# Gemini: Topics (20) without overlap
+# Gemini: topics without overlap
 # =========================
 def gemini_generate_topics(existing: List[str], n: int = 20) -> List[str]:
     existing_lower = {e.strip().lower() for e in existing if e.strip()}
@@ -261,20 +321,7 @@ JSON format exactly:
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
-    raw = (resp.text or "").strip()
-
-    # HARDEN JSON parsing
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # Try to extract JSON between { ... }
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            data = json.loads(raw[start:end+1])
-        else:
-            raise ValueError("Gemini did not return valid JSON for topics.")
-
+    data = safe_json_loads(resp.text or "")
     topics = []
     for t in data.get("topics", []):
         t = (t or "").strip()
@@ -289,7 +336,7 @@ JSON format exactly:
     return topics
 
 # =========================
-# Gemini: Script for N scenes (each 10s)
+# Gemini: script for N scenes (each 10s)
 # =========================
 def gemini_script(topic: str, scenes: int) -> Dict[str, Any]:
     prompt = f"""
@@ -303,7 +350,7 @@ Rules:
 - Each scene should be spoken in ~10 seconds.
 - Each scene should have:
   - "subtitle": short spoken line(s) for that 10s scene (1–2 sentences)
-  - "image_query": a search phrase for stock footage/images for that scene
+  - "image_query": a search phrase for stock images for that scene
 - Keep it accurate and simple.
 - Do NOT mention any other topics.
 
@@ -321,18 +368,7 @@ JSON format exactly:
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
-    raw = (resp.text or "").strip()
-
-    # HARDEN JSON parsing
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            data = json.loads(raw[start:end+1])
-        else:
-            raise ValueError("Gemini did not return valid JSON for script.")
+    data = safe_json_loads(resp.text or "")
 
     scenes_list = data.get("scenes", [])
     if not isinstance(scenes_list, list):
@@ -355,28 +391,31 @@ JSON format exactly:
 # =========================
 # Build one reel
 # =========================
-def build_reel(topic: str, script: Dict[str, Any], reel_index: int, progress_cb=None) -> Path:
-    start = time.time()
+def build_reel(
+    topic: str,
+    script: Dict[str, Any],
+    reel_index: int,
+    progress_cb=None,
+) -> Path:
+    t0 = time.time()
 
     def cb(p: float, msg: str):
         if progress_cb:
-            progress_cb(p, msg, time.time() - start)
+            progress_cb(p, msg, time.time() - t0)
 
-    cb(0.02, "Preparing script...")
     scenes = script["scenes"]
     scenes_count = len(scenes)
     total_seconds = scenes_count * SCENE_SECONDS
-
     reel_id = f"reel{reel_index:02d}_{slugify(topic)}_{int(time.time())}"
 
     # 1) Images
-    cb(0.08, "Fetching images...")
+    cb(0.05, "Fetching images...")
     all_scene_image_pairs: List[List[Path]] = []
     for i, sc in enumerate(scenes, start=1):
         q = sc["image_query"]
-        paths = []
+        paths: List[Path] = []
         try:
-            photos = pexels_search(q, per_page=25)
+            photos = pexels_search(q, per_page=35)
         except Exception:
             photos = []
 
@@ -398,22 +437,22 @@ def build_reel(topic: str, script: Dict[str, Any], reel_index: int, progress_cb=
                         pass
             paths.append(make_placeholder(out, f"{topic} / scene {i}"))
         all_scene_image_pairs.append(paths)
-        cb(0.08 + 0.35 * (i / scenes_count), f"Images {i}/{scenes_count}")
-        time.sleep(0.15)
+        cb(0.05 + 0.30 * (i / scenes_count), f"Images {i}/{scenes_count}")
+        time.sleep(0.10)
 
     # 2) Audio per scene => exactly 10s
-    cb(0.45, "Generating voiceover (scene-synced)...")
+    cb(0.40, "Generating voiceover (scene-synced)...")
     audio_clips = []
     for i, sc in enumerate(scenes, start=1):
         mp3 = AUD_DIR / f"{reel_id}_scene_{i:02d}.mp3"
         a = make_scene_audio(sc["subtitle"], mp3, duration=SCENE_SECONDS)
         audio_clips.append(a)
-        cb(0.45 + 0.18 * (i / scenes_count), f"Voiceover {i}/{scenes_count}")
+        cb(0.40 + 0.20 * (i / scenes_count), f"Voiceover {i}/{scenes_count}")
 
     full_audio = concatenate_audioclips(audio_clips).set_duration(total_seconds)
 
-    # 3) Build video
-    cb(0.68, "Building video (subtitles + transitions)...")
+    # 3) Video with smooth crossfade + subtitle overlay
+    cb(0.62, "Building video (subtitles + smooth transitions)...")
     scene_videos = []
     for i, sc in enumerate(scenes, start=1):
         imgs = all_scene_image_pairs[i - 1]
@@ -422,6 +461,7 @@ def build_reel(topic: str, script: Dict[str, Any], reel_index: int, progress_cb=
         c1 = ImageClip(str(imgs[0])).set_duration(IMG_SECONDS)
         c2 = ImageClip(str(imgs[1])).set_duration(IMG_SECONDS)
 
+        # slight zoom (gentle)
         c1 = c1.fx(vfx.resize, 1.03)
         c2 = c2.fx(vfx.resize, 1.03)
 
@@ -437,8 +477,9 @@ def build_reel(topic: str, script: Dict[str, Any], reel_index: int, progress_cb=
         composed = composed.set_audio(audio_clips[i - 1]).set_duration(SCENE_SECONDS)
 
         scene_videos.append(composed)
-        cb(0.68 + 0.20 * (i / scenes_count), f"Scene {i}/{scenes_count}")
+        cb(0.62 + 0.26 * (i / scenes_count), f"Scene {i}/{scenes_count}")
 
+    # crossfade between scenes
     d_scene = min(CROSSFADE, 0.8)
     for k in range(1, len(scene_videos)):
         scene_videos[k] = scene_videos[k].crossfadein(d_scene)
@@ -459,45 +500,46 @@ def build_reel(topic: str, script: Dict[str, Any], reel_index: int, progress_cb=
         ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
         logger=None,
     )
-    cb(1.0, "Done.")
+    cb(1.0, "Done")
+
     try:
         final_video.close()
     except Exception:
         pass
+
     return out
 
 # =========================
-# UI
+# ZIP helper
 # =========================
-st.set_page_config(page_title="Reel Factory", layout="wide")
-st.title("Reel Factory — Gemini Script + Pexels Images + Subtitle Overlay")
+def zip_files(paths: List[Path], out_zip: Path) -> Path:
+    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for p in paths:
+            if p.exists():
+                z.write(p, arcname=p.name)
+    return out_zip
 
-# Init session state
-if "topics_20" not in st.session_state:
-    st.session_state["topics_20"] = []
-if "selected_topic" not in st.session_state:
-    st.session_state["selected_topic"] = ""
-if "scenes" not in st.session_state:
-    st.session_state["scenes"] = 6
-
-# Restore last topics after reruns/restarts
+# =========================
+# Restore latest topics on start
+# =========================
 if not st.session_state["topics_20"]:
     st.session_state["topics_20"] = load_latest_topics()
     if st.session_state["topics_20"] and not st.session_state["selected_topic"]:
         st.session_state["selected_topic"] = st.session_state["topics_20"][0]
 
+# =========================
+# UI
+# =========================
 colA, colB = st.columns([1.1, 0.9])
 
 with colA:
     st.subheader("Step 1 — Generate 20 Topics (non-overlapping)")
-    scenes = st.selectbox("Scenes per reel", options=[6, 8], index=0)
-    st.session_state["scenes"] = scenes
-    total_len = scenes * SCENE_SECONDS
-    st.caption(f"Each scene is {SCENE_SECONDS}s → Reel length ≈ {total_len}s")
+    scenes = st.selectbox("Scenes per reel", options=[6, 8], index=0, key="scenes_select")
+    st.session_state["scenes"] = int(scenes)
+    st.caption(f"Each scene is {SCENE_SECONDS}s → Reel length ≈ {st.session_state['scenes']*SCENE_SECONDS}s")
 
-    if st.button("Generate 20 New Topics"):
+    if st.button("Generate 20 New Topics", key="btn_topics"):
         history = ensure_history()
-
         try:
             with st.spinner("Asking Gemini for 20 new topics..."):
                 topics = gemini_generate_topics(history, n=20)
@@ -509,19 +551,20 @@ with colA:
                 st.session_state["selected_topic"] = topics[0]
                 save_latest_topics(topics)
 
+                # update history (keep last 200 to prevent prompt explosion)
                 history.extend([t.strip().lower() for t in topics if t.strip()])
                 history = list(dict.fromkeys(history))[-200:]
                 save_json(TOPIC_HISTORY_FILE, history)
 
-                st.success("20 topics generated.")
-
+                st.success("20 topics generated and saved.")
         except Exception as e:
             st.error(f"Topic generation failed: {e}")
             st.info("Streamlit Cloud → Manage app → Logs shows full details.")
 
+    # Topic dropdown (Reel 1..20)
     if st.session_state["topics_20"]:
         labels = [f"Reel {i+1}: {t}" for i, t in enumerate(st.session_state["topics_20"])]
-        chosen = st.selectbox("Select a reel topic", options=labels, index=0)
+        chosen = st.selectbox("Select a reel topic", options=labels, index=0, key="topic_dropdown")
         idx = labels.index(chosen)
         topic = st.session_state["topics_20"][idx]
         st.session_state["selected_topic"] = topic
@@ -530,66 +573,253 @@ with colA:
     else:
         st.info("Click 'Generate 20 New Topics' to populate the dropdown.")
 
+    st.divider()
+    st.subheader("Batch Mode (Streamlit Cloud only)")
+
+    st.session_state["batch_count"] = st.slider(
+        "How many reels to generate now?",
+        min_value=1,
+        max_value=20,
+        value=int(st.session_state["batch_count"]),
+        step=1,
+        key="batch_count_slider",
+    )
+
+    st.session_state["batch_only_missing"] = st.checkbox(
+        "Only build reels that are missing video (skip already done)",
+        value=bool(st.session_state["batch_only_missing"]),
+        key="batch_skip_done",
+    )
+
+    st.caption("Batch will: Script → Images → Voiceover → Video → Save → Download buttons.")
+
 with colB:
-    st.subheader("Step 2 — Create Script + Build Video")
-    topic = st.session_state.get("selected_topic", "").strip()
+    st.subheader("Step 2 — Create Script + Build Video (single or batch)")
+    topic = (st.session_state.get("selected_topic") or "").strip()
+
+    db = ensure_db()
+    reels = db.get("reels", {})
+    reel_key = topic.lower() if topic else ""
+
+    # ---- Single controls ----
     if not topic:
         st.warning("Generate topics and select one first.")
     else:
-        db = ensure_db()
-        reel_key = topic.lower()
-
-        exists = reel_key in db["reels"]
-        if exists:
-            st.success("This topic already has a saved script/video.")
-            st.json(db["reels"][reel_key]["script"])
-            vp = db["reels"][reel_key].get("video_path")
+        # Show saved info if exists
+        if reel_key in reels:
+            st.success("Saved entry exists for this topic.")
+            if "script" in reels[reel_key]:
+                st.json(reels[reel_key]["script"])
+            vp = reels[reel_key].get("video_path")
             if vp and Path(vp).exists():
                 st.video(vp)
 
-        if st.button("Generate Script (Gemini)"):
-            try:
-                with st.spinner("Generating script from Gemini..."):
-                    script = gemini_script(topic, scenes=st.session_state["scenes"])
-                db["reels"][reel_key] = db["reels"].get(reel_key, {})
-                db["reels"][reel_key]["topic"] = topic
-                db["reels"][reel_key]["script"] = script
-                db["reels"][reel_key]["updated_at"] = int(time.time())
-                save_json(REELS_DB_FILE, db)
-                st.success("Script saved.")
-                st.json(script)
-            except Exception as e:
-                st.error(f"Script generation failed: {e}")
+        col1, col2 = st.columns(2)
 
-        db = ensure_db()
-        script = db["reels"].get(reel_key, {}).get("script")
-
-        if script:
-            st.caption("Build uses: 2 images/scene, subtitles overlay, smooth crossfade, scene-synced voiceover (10s per scene).")
-
-            progress = st.progress(0)
-            status = st.empty()
-            eta = st.empty()
-
-            def cb(p, msg, elapsed):
-                progress.progress(int(p * 100))
-                status.write(f"{int(p*100)}% — {msg}")
-                if p > 0:
-                    remaining = (elapsed / p) - elapsed
-                    eta.write(f"ETA ~ {int(max(0, remaining))}s")
-
-            if st.button("Build Video (MP4)"):
+        with col1:
+            if st.button("Generate Script (Gemini)", key="btn_script_single"):
                 try:
-                    with st.spinner("Building MP4..."):
-                        out = build_reel(topic, script, reel_index=1, progress_cb=cb)
-
+                    with st.spinner("Generating script from Gemini..."):
+                        script = gemini_script(topic, scenes=st.session_state["scenes"])
                     db = ensure_db()
-                    db["reels"][reel_key]["video_path"] = str(out)
+                    db["reels"].setdefault(reel_key, {})
+                    db["reels"][reel_key]["topic"] = topic
+                    db["reels"][reel_key]["script"] = script
                     db["reels"][reel_key]["updated_at"] = int(time.time())
                     save_json(REELS_DB_FILE, db)
-
-                    st.success("Video created and saved.")
-                    st.video(str(out))
-                    st.download_button("Download MP4", open(out, "rb"), file_name=out.name, mime="video/mp4")
+                    st.success("Script saved.")
+                    st.json(script)
                 except Exception as e:
-                    st.error(f"Video build failed: {e}")
+                    st.error(f"Script generation failed: {e}")
+
+        with col2:
+            if st.button("Build Video (single MP4)", key="btn_video_single"):
+                db = ensure_db()
+                script = db["reels"].get(reel_key, {}).get("script")
+                if not script:
+                    st.error("No script saved yet. Click 'Generate Script' first.")
+                else:
+                    progress = st.progress(0)
+                    status = st.empty()
+                    eta = st.empty()
+
+                    def cb(p, msg, elapsed):
+                        progress.progress(int(p * 100))
+                        status.write(f"{int(p*100)}% — {msg}")
+                        if p > 0:
+                            remaining = (elapsed / p) - elapsed
+                            eta.write(f"ETA ~ {int(max(0, remaining))}s")
+
+                    try:
+                        with st.spinner("Building MP4..."):
+                            out = build_reel(topic, script, reel_index=1, progress_cb=cb)
+
+                        db = ensure_db()
+                        db["reels"].setdefault(reel_key, {})
+                        db["reels"][reel_key]["video_path"] = str(out)
+                        db["reels"][reel_key]["updated_at"] = int(time.time())
+                        save_json(REELS_DB_FILE, db)
+
+                        st.session_state["last_single_mp4"] = str(out)
+
+                        st.success("Video created and saved.")
+                        st.video(str(out))
+                        st.download_button(
+                            "Download MP4",
+                            data=open(out, "rb"),
+                            file_name=out.name,
+                            mime="video/mp4",
+                            key="dl_single_mp4",
+                        )
+                    except Exception as e:
+                        st.error(f"Video build failed: {e}")
+                        st.info("Streamlit Cloud → Manage app → Logs shows full details.")
+
+    st.divider()
+
+    # ---- Batch mode ----
+    st.subheader("Step 3 — Batch Build (auto-generate scripts + videos)")
+
+    if not st.session_state["topics_20"]:
+        st.warning("Generate 20 topics first (Step 1).")
+    else:
+        batch_n = int(st.session_state["batch_count"])
+        batch_topics = st.session_state["topics_20"][:batch_n]
+
+        # Filter if "only missing"
+        if st.session_state["batch_only_missing"]:
+            db = ensure_db()
+            filtered = []
+            for t in batch_topics:
+                k = t.lower()
+                vp = db.get("reels", {}).get(k, {}).get("video_path", "")
+                if not vp or not Path(vp).exists():
+                    filtered.append(t)
+            batch_topics = filtered
+
+        st.caption(f"Batch queue size: {len(batch_topics)} reel(s)")
+
+        overall_bar = st.progress(0)
+        overall_status = st.empty()
+        overall_eta = st.empty()
+
+        per_reel_status = st.empty()
+        per_reel_bar = st.progress(0)
+
+        built_paths: List[Path] = []
+
+        def update_overall(done: int, total: int, start_ts: float):
+            if total <= 0:
+                overall_bar.progress(0)
+                overall_status.write("Nothing to build.")
+                overall_eta.write("")
+                return
+            frac = done / total
+            overall_bar.progress(int(frac * 100))
+            overall_status.write(f"Overall: {done}/{total} reels ({int(frac*100)}%)")
+            elapsed = time.time() - start_ts
+            if frac > 0:
+                remaining = (elapsed / frac) - elapsed
+                overall_eta.write(f"Overall ETA ~ {int(max(0, remaining))}s")
+
+        if st.button("Start Batch Build", key="btn_batch"):
+            start_ts = time.time()
+            total = len(batch_topics)
+            done = 0
+            update_overall(done, total, start_ts)
+
+            if total == 0:
+                st.info("No reels to build (either none selected or all already exist).")
+            else:
+                for i, t in enumerate(batch_topics, start=1):
+                    per_reel_bar.progress(0)
+                    per_reel_status.write(f"Reel {i}/{total}: preparing…")
+
+                    # 1) Script (save)
+                    try:
+                        db = ensure_db()
+                        k = t.lower()
+                        script = db.get("reels", {}).get(k, {}).get("script")
+
+                        if not script:
+                            per_reel_status.write(f"Reel {i}/{total}: generating script…")
+                            script = gemini_script(t, scenes=int(st.session_state["scenes"]))
+                            db = ensure_db()
+                            db["reels"].setdefault(k, {})
+                            db["reels"][k]["topic"] = t
+                            db["reels"][k]["script"] = script
+                            db["reels"][k]["updated_at"] = int(time.time())
+                            save_json(REELS_DB_FILE, db)
+
+                        # 2) Video
+                        def cb(p, msg, elapsed):
+                            per_reel_bar.progress(int(p * 100))
+                            # Estimate remaining for this reel
+                            if p > 0:
+                                remaining = (elapsed / p) - elapsed
+                                per_reel_status.write(
+                                    f"Reel {i}/{total} — {int(p*100)}%: {msg} | ETA ~ {int(max(0, remaining))}s"
+                                )
+                            else:
+                                per_reel_status.write(f"Reel {i}/{total} — {int(p*100)}%: {msg}")
+
+                        out = build_reel(t, script, reel_index=i, progress_cb=cb)
+
+                        db = ensure_db()
+                        db["reels"].setdefault(k, {})
+                        db["reels"][k]["video_path"] = str(out)
+                        db["reels"][k]["updated_at"] = int(time.time())
+                        save_json(REELS_DB_FILE, db)
+
+                        built_paths.append(Path(out))
+
+                    except Exception as e:
+                        per_reel_status.write(f"Reel {i}/{total} failed: {e}")
+
+                    done += 1
+                    update_overall(done, total, start_ts)
+
+                # ZIP output
+                if built_paths:
+                    zip_out = VID_DIR / f"batch_{int(time.time())}_{len(built_paths)}reels.zip"
+                    zip_files(built_paths, zip_out)
+                    st.session_state["last_build_zip_path"] = str(zip_out)
+
+                    st.success(f"Batch completed. Built {len(built_paths)} reel(s).")
+                    st.download_button(
+                        "Download ALL MP4s as ZIP",
+                        data=open(zip_out, "rb"),
+                        file_name=zip_out.name,
+                        mime="application/zip",
+                        key="dl_batch_zip",
+                    )
+
+                else:
+                    st.info("Batch finished, but no new videos were created (all were skipped or failed).")
+
+    st.divider()
+    st.subheader("Saved Library (from cache/reels_db.json)")
+    db = ensure_db()
+    reels = db.get("reels", {})
+
+    if not reels:
+        st.caption("No saved reels yet.")
+    else:
+        # show a compact list
+        items = []
+        for k, v in reels.items():
+            vp = v.get("video_path", "")
+            ok = bool(vp and Path(vp).exists())
+            items.append((v.get("topic", k), "✅" if ok else "❌", vp))
+        items.sort(key=lambda x: x[0].lower())
+
+        for topic_name, ok, vp in items[:50]:
+            st.write(f"{ok} {topic_name}")
+            if vp and Path(vp).exists():
+                st.download_button(
+                    f"Download: {Path(vp).name}",
+                    data=open(vp, "rb"),
+                    file_name=Path(vp).name,
+                    mime="video/mp4",
+                    key=f"dl_{slugify(topic_name)}_{Path(vp).name}",
+                )
