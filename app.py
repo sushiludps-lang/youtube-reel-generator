@@ -36,7 +36,7 @@ VID_DIR.mkdir(exist_ok=True)
 # Page setup
 # -----------------------
 st.set_page_config(page_title="Reel Generator", layout="wide", page_icon="🎬")
-st.title("YouTube Reel Generator – Full MP4 Builder")
+st.title("YouTube Reel Generator – Full MP4 Builder (AI Images)")
 
 # -----------------------
 # Secrets + GenAI client
@@ -51,10 +51,10 @@ client = genai.Client(api_key=api_key)
 # Text model for script JSON
 TEXT_MODEL = "gemini-2.5-flash"
 # Image model for scene images
-IMAGE_MODEL = "gemini-2.5-flash-image"  # image generation model :contentReference[oaicite:1]{index=1}
+IMAGE_MODEL = "gemini-2.5-flash-image"
 
 # -----------------------
-# User input
+# UI inputs
 # -----------------------
 topic = st.text_input("Enter a topic for the YouTube Reel", value="Why does fire have no shadow?")
 num_scenes = st.slider("Number of scenes", 5, 10, 7)
@@ -82,7 +82,6 @@ def make_placeholder_image(text: str, idx: int) -> Path:
 
     draw.text((80, 120), f"Scene {idx}", fill=(200, 200, 200), font=font)
 
-    # Simple wrap
     words = text.split()
     lines, line = [], ""
     for w in words:
@@ -109,20 +108,17 @@ def generate_ai_image(scene_text: str, idx: int) -> Path | None:
     Returns Path if successful, else None.
     """
     prompt = (
-        f"Create a single vertical 9:16 image for a short YouTube reel.\n"
+        f"Create a single vertical 9:16 image for a YouTube Shorts reel.\n"
         f"Style: {image_style}.\n"
         f"Scene: {scene_text}\n"
         f"Do not add any text overlays or subtitles."
     )
 
-    # Request 9:16 aspect ratio for vertical reels :contentReference[oaicite:2]{index=2}
     resp = client.models.generate_content(
         model=IMAGE_MODEL,
         contents=[prompt],
         config=types.GenerateContentConfig(
-            image_config=types.ImageConfig(
-                aspect_ratio="9:16"
-            )
+            image_config=types.ImageConfig(aspect_ratio="9:16")
         ),
     )
 
@@ -138,7 +134,6 @@ def generate_ai_image(scene_text: str, idx: int) -> Path | None:
         if inline:
             data = getattr(inline, "data", None)
             if data:
-                # data may be bytes or base64 string depending on SDK version
                 if isinstance(data, (bytes, bytearray)):
                     image_bytes = bytes(data)
                 elif isinstance(data, str):
@@ -171,26 +166,30 @@ Format EXACTLY:
 }}
 """.strip()
 
-    # ---- Text generation (JSON)
-    result = client.models.generate_content(model=TEXT_MODEL, contents=script_prompt)
+    # ---- Text generation (FORCE JSON)
+    result = client.models.generate_content(
+        model=TEXT_MODEL,
+        contents=script_prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json"
+        ),
+    )
+
     raw = (getattr(result, "text", "") or "").strip()
 
     if not raw:
-        st.error("Gemini returned empty output. Click again or change the topic.")
+        st.error("Gemini returned empty output.")
         st.stop()
 
     raw = raw.replace("```json", "").replace("```", "").strip()
 
+    # ---- Robust JSON parse (and show raw if it fails)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        start, end = raw.find("{"), raw.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            data = json.loads(raw[start:end + 1])
-        else:
-            st.error("Gemini did not return valid JSON. Raw output:")
-            st.code(raw)
-            st.stop()
+        st.error("Gemini did not return valid JSON. Raw output below:")
+        st.code(raw)
+        st.stop()
 
     # ---- Display + make assets
     st.subheader("Hook")
@@ -208,20 +207,21 @@ Format EXACTLY:
 
     st.subheader("Scenes")
     progress = st.progress(0)
-    for i, scene in enumerate(scenes, start=1):
-        narration_parts.append(str(scene))
 
-        # AI image first (if enabled), fallback to placeholder
+    for i, scene in enumerate(scenes, start=1):
+        scene_text = str(scene)
+        narration_parts.append(scene_text)
+
         img_path = None
         if use_ai_images:
-            img_path = generate_ai_image(str(scene), i)
+            img_path = generate_ai_image(scene_text, i)
 
         if not img_path:
-            img_path = make_placeholder_image(str(scene), i)
+            img_path = make_placeholder_image(scene_text, i)
 
         images.append(img_path)
 
-        st.write(f"**Scene {i}:** {scene}")
+        st.write(f"**Scene {i}:** {scene_text}")
         st.image(str(img_path), use_container_width=True)
 
         progress.progress(i / len(scenes))
@@ -230,7 +230,7 @@ Format EXACTLY:
     st.info(cta)
     narration_parts.append(cta)
 
-    narration = ". ".join([p.strip() for p in narration_parts if p and str(p).strip()]) + "."
+    narration = ". ".join([p.strip() for p in narration_parts if p and p.strip()]) + "."
 
     # ---- Voiceover
     audio_path = AUD_DIR / "voiceover.mp3"
