@@ -6,9 +6,13 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
+from moviepy import (
+    ImageClip,
+    AudioFileClip,
+    CompositeVideoClip,
+)
 
-# MoviePy v2 effects (for smooth fades)
+# MoviePy v2 effects
 try:
     from moviepy import vfx
 except Exception:
@@ -31,7 +35,7 @@ IMAGES_PER_SCENE = 2  # fixed
 # ===============================
 # UI
 # ===============================
-st.title("YouTube Reel Generator — Min Duration + Auto Scenes (2 images/scene)")
+st.title("YouTube Reel Generator — True Crossfade (2 images/scene)")
 
 topic = st.text_input("Topic", "Why does fire have no shadow?")
 
@@ -45,8 +49,8 @@ ENABLE_CAPTIONS = st.toggle("Burn captions on images", True)
 CAPTION_FONT_SIZE = st.slider("Caption font size", 42, 84, 64)
 CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 
-# Smooth transition control
-fade_seconds = st.slider("Smooth transition seconds", 0.2, 1.2, 0.6)
+# Crossfade settings
+crossfade_seconds = st.slider("Crossfade seconds", 0.2, 1.2, 0.6)
 
 DEBUG = st.toggle("Show debug", False)
 
@@ -130,7 +134,7 @@ def fetch_images(scene_text):
     return paths[:IMAGES_PER_SCENE]
 
 # ===============================
-# LONGER SCRIPT POOL
+# SCRIPT POOL
 # ===============================
 def script_pool(topic: str):
     return [
@@ -188,23 +192,56 @@ def build_script(topic, target_scene_sec, min_secs, min_s, max_s):
     return script, mp3, dur
 
 # ===============================
-# SMOOTH FADE HELPERS (MoviePy v2 safe)
+# TRUE CROSSFADE BUILDER (no black frames)
 # ===============================
-def apply_fades(clip, fsec):
-    if fsec <= 0:
-        return clip
-    if vfx is not None and hasattr(clip, "with_effects"):
-        effs = []
-        if hasattr(vfx, "FadeIn"):
-            effs.append(vfx.FadeIn(fsec))
-        if hasattr(vfx, "FadeOut"):
-            effs.append(vfx.FadeOut(fsec))
-        if effs:
-            try:
-                return clip.with_effects(effs)
-            except Exception:
-                return clip
-    return clip  # if vfx not available, no fades
+def build_crossfade_video(image_paths, per_image_duration, xfade):
+    """
+    Timeline:
+      clip0 starts at 0
+      clip1 starts at per_image_duration - xfade
+      clip2 starts at 2*(per_image_duration - xfade)
+      ...
+    Crossfade is achieved by overlapping + CrossFadeIn/Out effects.
+    """
+    n = len(image_paths)
+    if n == 0:
+        raise ValueError("No images to build video.")
+
+    # keep crossfade smaller than half clip duration
+    xfade = min(xfade, per_image_duration * 0.45)
+
+    step = per_image_duration - xfade
+    if step <= 0:
+        step = per_image_duration * 0.7
+        xfade = per_image_duration - step
+
+    clips = []
+    for i, p in enumerate(image_paths):
+        c = ImageClip(str(p), duration=per_image_duration)
+
+        start_t = i * step
+        # set start (v2: with_start, older: set_start)
+        c = c.with_start(start_t) if hasattr(c, "with_start") else c.set_start(start_t)
+
+        # apply true crossfade
+        if vfx is not None and hasattr(c, "with_effects"):
+            effs = []
+            if i > 0 and hasattr(vfx, "CrossFadeIn"):
+                effs.append(vfx.CrossFadeIn(xfade))
+            if i < n - 1 and hasattr(vfx, "CrossFadeOut"):
+                effs.append(vfx.CrossFadeOut(xfade))
+            if effs:
+                try:
+                    c = c.with_effects(effs)
+                except Exception:
+                    pass
+
+        clips.append(c)
+
+    total_duration = (n - 1) * step + per_image_duration
+    video = CompositeVideoClip(clips, size=(WIDTH, HEIGHT))
+    video = video.with_duration(total_duration) if hasattr(video, "with_duration") else video.set_duration(total_duration)
+    return video, total_duration, xfade, step
 
 # ===============================
 # BUILD VIDEO
@@ -218,44 +255,24 @@ if st.button("Generate Final MP4 Reel"):
     scene_duration = audio_duration / scenes
     per_image_duration = scene_duration / IMAGES_PER_SCENE
 
-    # Audio
     audio = AudioFileClip(str(voice_path))
 
-    # Collect image paths first (so we can rebuild clips safely)
-    all_image_paths = []
+    # collect images (2 per scene)
+    image_paths = []
     used = 0
-
     for scene_text in script:
         imgs = fetch_images(scene_text)
         if not imgs:
             st.error("No images fetched from Pexels. Try a different topic or verify PEXELS_API_KEY.")
             st.stop()
-        for img in imgs:
-            all_image_paths.append(img)
-            used += 1
+        image_paths.extend(imgs)
+        used += len(imgs)
 
-    # Crossfade overlap (smooth). Keep it below half a clip duration.
-    overlap = min(fade_seconds, per_image_duration * 0.45)
-    nclips = len(all_image_paths)
+    video, video_dur, xfade_used, step_used = build_crossfade_video(
+        image_paths, per_image_duration, crossfade_seconds
+    )
 
-    # Compensate duration loss caused by overlap: loss = overlap*(N-1)
-    if nclips > 1 and overlap > 0:
-        total_loss = overlap * (nclips - 1)
-        add_each = total_loss / nclips
-    else:
-        add_each = 0.0
-
-    # Build clips with compensated duration, then add fades
-    clips = []
-    for img_path in all_image_paths:
-        dur = per_image_duration + add_each
-        c = ImageClip(str(img_path), duration=dur)
-        c = apply_fades(c, fade_seconds)
-        clips.append(c)
-
-    video = concatenate_videoclips(clips, method="compose", padding=-overlap)
-
-    # Trim audio if slightly longer
+    # Trim audio if slightly longer than video
     if hasattr(audio, "subclip") and audio.duration > video.duration:
         audio = audio.subclip(0, video.duration)
 
@@ -268,9 +285,9 @@ if st.button("Generate Final MP4 Reel"):
         st.write("Audio duration (s):", round(audio_duration, 2))
         st.write("Scenes:", scenes)
         st.write("Per image duration (s):", round(per_image_duration, 2))
-        st.write("Clips:", len(clips))
-        st.write("Fade seconds:", fade_seconds)
-        st.write("Overlap:", overlap)
+        st.write("Crossfade used (s):", round(xfade_used, 2))
+        st.write("Step (s):", round(step_used, 2))
+        st.write("Final video duration (s):", round(video.duration, 2))
 
     st.success(f"Done. Length: {video.duration:.1f}s • Scenes: {scenes} • Images: {used}")
     st.video(str(out))
