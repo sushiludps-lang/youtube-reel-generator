@@ -45,7 +45,7 @@ ENABLE_CAPTIONS = st.toggle("Burn captions on images", True)
 CAPTION_FONT_SIZE = st.slider("Caption font size", 42, 84, 64)
 CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 
-# NEW: smooth transition control
+# Smooth transition control
 fade_seconds = st.slider("Smooth transition seconds", 0.2, 1.2, 0.6)
 
 DEBUG = st.toggle("Show debug", False)
@@ -221,7 +221,8 @@ if st.button("Generate Final MP4 Reel"):
     # Audio
     audio = AudioFileClip(str(voice_path))
 
-    clips = []
+    # Collect image paths first (so we can rebuild clips safely)
+    all_image_paths = []
     used = 0
 
     for scene_text in script:
@@ -229,25 +230,28 @@ if st.button("Generate Final MP4 Reel"):
         if not imgs:
             st.error("No images fetched from Pexels. Try a different topic or verify PEXELS_API_KEY.")
             st.stop()
-
         for img in imgs:
-            c = ImageClip(str(img), duration=per_image_duration)
-            c = apply_fades(c, fade_seconds)
-            clips.append(c)
+            all_image_paths.append(img)
             used += 1
 
-    # Crossfade overlap = fade_seconds (very smooth)
-    # This reduces total duration by overlap, so we compensate by slightly increasing clip durations
-    # so final video matches audio.
-
+    # Crossfade overlap (smooth). Keep it below half a clip duration.
     overlap = min(fade_seconds, per_image_duration * 0.45)
-    nclips = len(clips)
+    nclips = len(all_image_paths)
+
+    # Compensate duration loss caused by overlap: loss = overlap*(N-1)
     if nclips > 1 and overlap > 0:
-        # compensate duration loss: total_loss = overlap * (nclips - 1)
         total_loss = overlap * (nclips - 1)
         add_each = total_loss / nclips
-        clips = [ImageClip(c.filename, duration=c.duration + add_each) for c in clips]  # rebuild clips
-        clips = [apply_fades(c, fade_seconds) for c in clips]
+    else:
+        add_each = 0.0
+
+    # Build clips with compensated duration, then add fades
+    clips = []
+    for img_path in all_image_paths:
+        dur = per_image_duration + add_each
+        c = ImageClip(str(img_path), duration=dur)
+        c = apply_fades(c, fade_seconds)
+        clips.append(c)
 
     video = concatenate_videoclips(clips, method="compose", padding=-overlap)
 
@@ -265,6 +269,7 @@ if st.button("Generate Final MP4 Reel"):
         st.write("Scenes:", scenes)
         st.write("Per image duration (s):", round(per_image_duration, 2))
         st.write("Clips:", len(clips))
+        st.write("Fade seconds:", fade_seconds)
         st.write("Overlap:", overlap)
 
     st.success(f"Done. Length: {video.duration:.1f}s • Scenes: {scenes} • Images: {used}")
