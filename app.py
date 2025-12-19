@@ -1,7 +1,11 @@
+import json
+import re
 import textwrap
-import requests
+import time
+import zipfile
 from pathlib import Path
 
+import requests
 import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -21,7 +25,10 @@ BASE = Path(__file__).parent
 IMG_DIR = BASE / "images"
 AUD_DIR = BASE / "audio"
 VID_DIR = BASE / "video"
-for d in (IMG_DIR, AUD_DIR, VID_DIR):
+CACHE_DIR = BASE / "cache"
+CACHE_FILE = CACHE_DIR / "pexels_cache.json"
+
+for d in (IMG_DIR, AUD_DIR, VID_DIR, CACHE_DIR):
     d.mkdir(exist_ok=True)
 
 PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
@@ -30,12 +37,12 @@ IMAGES_PER_SCENE = 2  # fixed
 # ===============================
 # UI
 # ===============================
-st.title("YouTube Reel Generator — True Crossfade + Synced to Narration")
+st.title("YouTube Reel Generator — Batch Mode (Streamlit Cloud)")
 
-topic = st.text_input("Topic", "Why does fire have no shadow?")
+mode = st.radio("Mode", ["Single Reel", "Batch (20 Reels)"], horizontal=True)
 
 target_scene_seconds = st.slider("Target seconds per scene", 4, 12, 7)
-min_video_seconds = st.slider("Minimum video length (seconds)", 10, 60, 30)
+min_video_seconds = st.slider("Minimum video length (seconds)", 10, 60, 45)
 min_scenes = st.slider("Minimum scenes", 2, 12, 6)
 max_scenes = st.slider("Maximum scenes", 3, 20, 10)
 
@@ -43,7 +50,11 @@ ENABLE_CAPTIONS = st.toggle("Burn captions on images", True)
 CAPTION_FONT_SIZE = st.slider("Caption font size", 42, 84, 64)
 CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 
-crossfade_seconds = st.slider("Crossfade seconds", 0.2, 1.2, 0.6)
+crossfade_seconds = st.slider("Crossfade seconds", 0.2, 1.2, 0.7)
+
+# Safety/rate-limit knobs (Pexels)
+pexels_delay = st.slider("Delay between Pexels calls (seconds)", 0.0, 1.5, 0.25)
+
 DEBUG = st.toggle("Show debug", False)
 
 # ===============================
@@ -62,6 +73,22 @@ def load_font(size):
     return ImageFont.load_default()
 
 FONT = load_font(CAPTION_FONT_SIZE)
+
+# ===============================
+# CACHE (Pexels results -> local image files)
+# ===============================
+def load_cache():
+    if CACHE_FILE.exists():
+        try:
+            return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_cache(cache: dict):
+    CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
+PEXELS_CACHE = load_cache()
 
 # ===============================
 # CAPTION BURN (PIL)
@@ -91,71 +118,109 @@ def burn_caption(img, caption):
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 # ===============================
-# PEXELS FETCH
+# Helpers
 # ===============================
-def fetch_images(scene_text):
-    headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": scene_text, "per_page": 30, "orientation": "portrait", "size": "large"}
-    r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    photos = r.json().get("photos", [])
+def slugify(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s[:60] or "topic"
 
-    paths = []
-    for i, p in enumerate(photos[:IMAGES_PER_SCENE]):
-        url = p["src"].get("portrait") or p["src"].get("large")
+def pexels_search(query: str):
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {"query": query, "per_page": 30, "orientation": "portrait", "size": "large"}
+    r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=25)
+    r.raise_for_status()
+    return r.json().get("photos", [])
+
+def download_and_prepare_image(url: str, out_path: Path, caption_text: str):
+    out_path.write_bytes(requests.get(url, timeout=25).content)
+    img = Image.open(out_path).convert("RGB")
+    img = ImageOps.exif_transpose(img)
+    img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+    if ENABLE_CAPTIONS:
+        img = burn_caption(img, caption_text)
+    img.save(out_path, quality=95)
+    return out_path
+
+# ===============================
+# PEXELS FETCH (2 images/scene) + cache
+# ===============================
+def fetch_images(scene_text: str):
+    cache_key = f"{scene_text}__{int(ENABLE_CAPTIONS)}__{CAPTION_FONT_SIZE}__{CAPTION_BOX_OPACITY}"
+    cached = PEXELS_CACHE.get(cache_key, [])
+    cached_paths = [Path(p) for p in cached if Path(p).exists()]
+
+    if len(cached_paths) >= IMAGES_PER_SCENE:
+        return cached_paths[:IMAGES_PER_SCENE]
+
+    # otherwise fetch
+    photos = pexels_search(scene_text)
+    time.sleep(pexels_delay)
+
+    paths = list(cached_paths)
+    idx = 0
+    for p in photos:
+        if len(paths) >= IMAGES_PER_SCENE:
+            break
+        url = p.get("src", {}).get("portrait") or p.get("src", {}).get("large")
         if not url:
             continue
 
-        img_path = IMG_DIR / f"img_{abs(hash((scene_text, i)))}.jpg"
-        img_path.write_bytes(requests.get(url, timeout=20).content)
+        img_path = IMG_DIR / f"img_{abs(hash((scene_text, idx, time.time_ns())))}.jpg"
+        idx += 1
 
-        img = Image.open(img_path).convert("RGB")
-        img = ImageOps.exif_transpose(img)
-        img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
-
-        if ENABLE_CAPTIONS:
-            img = burn_caption(img, scene_text)
-
-        img.save(img_path, quality=95)
-        paths.append(img_path)
+        try:
+            download_and_prepare_image(url, img_path, scene_text)
+            paths.append(img_path)
+        except Exception:
+            continue
 
     if not paths:
         return []
+
     while len(paths) < IMAGES_PER_SCENE:
         paths.append(paths[-1])
+
+    # save cache
+    PEXELS_CACHE[cache_key] = [str(p) for p in paths[:IMAGES_PER_SCENE]]
+    save_cache(PEXELS_CACHE)
+
     return paths[:IMAGES_PER_SCENE]
 
 # ===============================
-# SCRIPT POOL
+# SCRIPT POOL (free, no LLM)
 # ===============================
 def script_pool(topic: str):
     return [
         f"{topic} — quick answer.",
         "A shadow needs a strong background light and something that blocks it.",
         "Fire isn’t a solid object; it’s hot gas plus glowing soot particles.",
-        "Because fire emits light, it can ‘fill in’ the dark area you expect.",
-        "Flames are also partly transparent, so they don’t block all light strongly.",
+        "Because fire emits light, it can fill in the dark area you expect.",
+        "Flames are partly transparent, so they don’t block all light strongly.",
         "That’s why a candle often won’t cast a sharp shadow on a wall.",
         "But a brighter light behind the flame can force a visible shadow.",
         "Try it: flashlight behind a lighter, then look at the wall edge.",
         "If the flame is dim and the background light is strong, shadow becomes clearer.",
         "If the flame is bright, it washes out the shadow contrast.",
         "Moving flames blur edges, which makes shadows look weak.",
-        "So it’s not ‘zero shadow’—it’s usually ‘no crisp shadow’ in normal lighting.",
+        "So it’s not zero shadow—usually it’s no crisp shadow in normal lighting.",
         "You can tune light intensity to make it appear or disappear.",
         "That’s the physics: emission + transparency + contrast.",
         "Follow for more quick science reels.",
     ]
 
 # ===============================
-# BUILD SCRIPT UNTIL LONG ENOUGH
+# Build script until long enough (TTS duration-driven)
 # ===============================
 def tts_duration_for(script_lines):
     narration = " ".join(script_lines)
     tmp_mp3 = AUD_DIR / "tmp_voice.mp3"
     gTTS(narration).save(str(tmp_mp3))
     a = AudioFileClip(str(tmp_mp3))
-    return tmp_mp3, a.duration
+    dur = a.duration
+    a.close()
+    return tmp_mp3, dur
 
 def build_script(topic, target_scene_sec, min_secs, min_s, max_s):
     pool = script_pool(topic)
@@ -184,25 +249,23 @@ def build_script(topic, target_scene_sec, min_secs, min_s, max_s):
     return script, mp3, dur
 
 # ===============================
-# TRUE CROSSFADE (SYNCED TO AUDIO)
+# True crossfade synced to audio duration
 # ===============================
 def build_crossfade_video_synced(image_paths, audio_duration, xfade):
     n = len(image_paths)
     if n == 0:
         raise ValueError("No images to build video.")
 
-    # Ensure crossfade isn't too big
     xfade = max(0.0, min(xfade, 2.0))
 
-    # Compute per-image duration so that FINAL video duration == audio_duration
+    # D so final duration == audio_duration:
     # final = n*D - (n-1)*xfade  =>  D = (audio + (n-1)*xfade)/n
     D = (audio_duration + (n - 1) * xfade) / n
-    # Safety clamp: if D becomes too small, reduce xfade
     if D <= xfade * 1.1:
         xfade = D * 0.3
         D = (audio_duration + (n - 1) * xfade) / n
 
-    step = D - xfade  # start distance between clips
+    step = D - xfade
 
     clips = []
     for i, p in enumerate(image_paths):
@@ -210,6 +273,7 @@ def build_crossfade_video_synced(image_paths, audio_duration, xfade):
         start_t = i * step
         c = c.with_start(start_t) if hasattr(c, "with_start") else c.set_start(start_t)
 
+        # true crossfade if available
         if vfx is not None and hasattr(c, "with_effects"):
             effs = []
             if i > 0 and hasattr(vfx, "CrossFadeIn"):
@@ -226,47 +290,132 @@ def build_crossfade_video_synced(image_paths, audio_duration, xfade):
 
     video = CompositeVideoClip(clips, size=(WIDTH, HEIGHT))
     video = video.with_duration(audio_duration) if hasattr(video, "with_duration") else video.set_duration(audio_duration)
-    return video, D, xfade, step
+    return video
 
 # ===============================
-# BUILD VIDEO
+# Single reel builder (returns mp4 path)
 # ===============================
-if st.button("Generate Final MP4 Reel"):
+def build_one_reel(topic: str, index: int):
     script, voice_path, audio_duration = build_script(
         topic, target_scene_seconds, min_video_seconds, min_scenes, max_scenes
     )
 
     audio = AudioFileClip(str(voice_path))
 
-    # Collect 2 images per scene
+    # 2 images per scene
     image_paths = []
-    used = 0
     for scene_text in script:
         imgs = fetch_images(scene_text)
         if not imgs:
-            st.error("No images fetched from Pexels. Try a different topic or verify PEXELS_API_KEY.")
-            st.stop()
+            audio.close()
+            raise RuntimeError("No images from Pexels for a scene. Try a different topic.")
         image_paths.extend(imgs)
-        used += len(imgs)
 
-    video, per_img_D, xfade_used, step_used = build_crossfade_video_synced(
-        image_paths, audio.duration, crossfade_seconds
-    )
-
+    video = build_crossfade_video_synced(image_paths, audio.duration, crossfade_seconds)
     video = video.with_audio(audio) if hasattr(video, "with_audio") else video.set_audio(audio)
 
-    out = VID_DIR / "final_reel.mp4"
+    out = VID_DIR / f"reel_{index:02d}_{slugify(topic)}.mp4"
     video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
 
-    if DEBUG:
-        st.write("Audio duration (s):", round(audio.duration, 2))
-        st.write("Scenes:", len(script))
-        st.write("Images:", len(image_paths))
-        st.write("Per-image duration D (s):", round(per_img_D, 3))
-        st.write("Crossfade used (s):", round(xfade_used, 3))
-        st.write("Step (s):", round(step_used, 3))
-        st.write("Video duration (s):", round(video.duration, 2))
+    # cleanup
+    try:
+        video.close()
+    except Exception:
+        pass
+    try:
+        audio.close()
+    except Exception:
+        pass
 
-    st.success(f"Done. Length: {video.duration:.1f}s • Scenes: {len(script)} • Images: {used}")
-    st.video(str(out))
-    st.download_button("Download MP4", open(out, "rb"), "reel.mp4", mime="video/mp4")
+    return out
+
+# ===============================
+# UI: Single or Batch
+# ===============================
+if mode == "Single Reel":
+    topic_single = st.text_input("Single topic", "Why does fire have no shadow?")
+    if st.button("Generate 1 Reel"):
+        with st.spinner("Generating..."):
+            mp4_path = build_one_reel(topic_single, 1)
+        st.success("Done.")
+        st.video(str(mp4_path))
+        st.download_button("Download MP4", open(mp4_path, "rb"), mp4_path.name, mime="video/mp4")
+
+else:
+    topics_text = st.text_area(
+        "Paste up to 20 topics (one per line)",
+        value="\n".join([
+            "Why does fire have no shadow?",
+            "Why is the sky blue?",
+            "Why do we see lightning before thunder?",
+            "Why does ice float on water?",
+            "Why does metal feel colder than wood?",
+            "Why do onions make you cry?",
+            "Why do bubbles look rainbow-colored?",
+            "Why does salt melt ice?",
+            "Why does the moon look bigger near the horizon?",
+            "Why do headphones get tangled so easily?",
+            "Why do we yawn when others yawn?",
+            "Why do cats land on their feet?",
+            "Why do leaves change color?",
+            "Why does coffee smell stronger than it tastes?",
+            "Why do magnets stick to some metals only?",
+            "Why do we get goosebumps?",
+            "Why does glass look solid but is actually a liquid myth?",
+            "Why does popcorn pop?",
+            "Why do airplanes leave white trails?",
+            "Why do candles flicker?",
+        ])
+    )
+
+    if st.button("Generate Batch (20 Reels)"):
+        topics = [t.strip() for t in topics_text.splitlines() if t.strip()]
+        topics = topics[:20]
+
+        if not topics:
+            st.error("Paste at least 1 topic.")
+            st.stop()
+
+        # clear old outputs (optional)
+        # for f in VID_DIR.glob("reel_*.mp4"):
+        #     f.unlink(missing_ok=True)
+
+        prog = st.progress(0)
+        status = st.empty()
+
+        outputs = []
+        errors = []
+
+        for i, t in enumerate(topics, start=1):
+            status.write(f"Generating {i}/{len(topics)}: {t}")
+            try:
+                mp4_path = build_one_reel(t, i)
+                outputs.append(mp4_path)
+            except Exception as e:
+                errors.append((t, str(e)))
+
+            prog.progress(int(i / len(topics) * 100))
+
+        # zip everything
+        zip_path = VID_DIR / "reels_batch.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            for p in outputs:
+                z.write(p, arcname=p.name)
+
+        if errors:
+            st.error("Some reels failed:")
+            for t, msg in errors:
+                st.write(f"- {t}: {msg}")
+
+        st.success(f"Batch done: {len(outputs)}/{len(topics)} reels created.")
+        st.download_button("Download ZIP (all MP4s)", open(zip_path, "rb"), zip_path.name, mime="application/zip")
+
+        # Preview first one
+        if outputs:
+            st.write("Preview (first reel):")
+            st.video(str(outputs[0]))
+
+        if DEBUG and outputs:
+            st.write("Saved files:")
+            for p in outputs:
+                st.write(p.name)
