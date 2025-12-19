@@ -4,3 +4,4 @@ pillow
 gtts
 moviepy
 imageio-ffmpeg
+requests
