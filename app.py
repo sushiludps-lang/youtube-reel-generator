@@ -6,8 +6,8 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# MoviePy v2 compatible imports
-from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
+# MoviePy v2 imports
+from moviepy import ImageClip, AudioFileClip, concatenate_videoclips, CompositeAudioClip
 from moviepy.audio.AudioClip import AudioArrayClip
 import numpy as np
 
@@ -120,8 +120,7 @@ def fetch_images(scene_text, font):
             continue
 
         img_path = IMG_DIR / f"img_{abs(hash((scene_text, i)))}.jpg"
-        data = requests.get(url, timeout=20).content
-        img_path.write_bytes(data)
+        img_path.write_bytes(requests.get(url, timeout=20).content)
 
         img = Image.open(img_path).convert("RGB")
         img = ImageOps.exif_transpose(img)
@@ -150,32 +149,31 @@ def apply_zoom(clip):
     return clip.resize(lambda t: 1 + (ZOOM_STRENGTH - 1) * (t / clip.duration))
 
 # ===============================
-# AUDIO FIT: pad or trim to 60s (NO speedx needed)
+# AUDIO FIT: pad with silence to 60s (no speedx, no concatenate/subclip)
 # ===============================
-def fit_audio_to_duration(audio: AudioFileClip, target_seconds: float) -> AudioFileClip:
-    if audio.duration >= target_seconds:
-        return audio.subclip(0, target_seconds)
-
-    # pad silence to reach target
+def fit_audio_to_60s(narration_audio: AudioFileClip, target_seconds: float) -> CompositeAudioClip:
+    # 60s silence base
     sr = 44100
-    missing = target_seconds - audio.duration
-    n = int(sr * missing)
-    silence = np.zeros((n, 2), dtype=np.float32)  # stereo
-    silence_clip = AudioArrayClip(silence, fps=sr)
-    return concatenate_audios([audio, silence_clip]).subclip(0, target_seconds)
+    silence = np.zeros((int(sr * target_seconds), 2), dtype=np.float32)
+    bed = AudioArrayClip(silence, fps=sr)
 
-def concatenate_audios(clips):
-    # moviepy v2: easiest is to convert to AudioClip list with concatenation via VideoClip trick
-    # We'll just use AudioArrayClip join:
-    arrays = []
-    fps = 44100
-    for c in clips:
-        if hasattr(c, "fps") and c.fps:
-            fps = c.fps
-        arr = c.to_soundarray(fps=fps)
-        arrays.append(arr)
-    joined = np.vstack(arrays)
-    return AudioArrayClip(joined, fps=fps)
+    # Trim narration if longer than target
+    if narration_audio.duration > target_seconds:
+        if hasattr(narration_audio, "subclip"):
+            narration_audio = narration_audio.subclip(0, target_seconds)
+        elif hasattr(narration_audio, "subclipped"):
+            narration_audio = narration_audio.subclipped(0, target_seconds)
+
+    # Overlay narration on silence bed
+    mixed = CompositeAudioClip([bed, narration_audio])
+
+    # Force duration to target (MoviePy v2 uses with_duration)
+    if hasattr(mixed, "with_duration"):
+        mixed = mixed.with_duration(target_seconds)
+    else:
+        mixed = mixed.set_duration(target_seconds)
+
+    return mixed
 
 # ===============================
 # BUILD VIDEO
@@ -187,8 +185,8 @@ if st.button("Generate Final MP4 Reel"):
     narration = " ".join(script)
     audio_path = AUD_DIR / "voice.mp3"
     gTTS(narration).save(str(audio_path))
-    audio = AudioFileClip(str(audio_path))
-    audio = fit_audio_to_duration(audio, TARGET_SECONDS)
+    narration_audio = AudioFileClip(str(audio_path))
+    audio = fit_audio_to_60s(narration_audio, TARGET_SECONDS)
 
     # Visuals: 6 scenes × 2 images = 12 images, 5s each
     per_image_dur = SCENE_SECONDS / IMAGES_PER_SCENE  # 5 seconds
@@ -210,16 +208,22 @@ if st.button("Generate Final MP4 Reel"):
             used_images += 1
 
     video = concatenate_videoclips(clips, method="compose", padding=-TRANSITION_SEC)
-    video = video.with_audio(audio)
+
+    # MoviePy v2: prefer with_audio
+    if hasattr(video, "with_audio"):
+        video = video.with_audio(audio)
+    else:
+        video = video.set_audio(audio)
 
     out = VID_DIR / "final_reel.mp4"
     video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
 
     if DEBUG:
-        st.write("Audio duration:", round(audio.duration, 2))
-        st.write("Video duration:", round(video.duration, 2))
+        st.write("Narration duration:", round(narration_audio.duration, 2))
+        st.write("Final audio duration:", round(audio.duration, 2))
+        st.write("Final video duration:", round(video.duration, 2))
         st.write("Images used:", used_images)
 
-    st.success("Done.")
+    st.success("Done (audio padded to 60s, captions aligned to 6×10s timeline).")
     st.video(str(out))
     st.download_button("Download MP4", open(out, "rb"), "reel.mp4", mime="video/mp4")
