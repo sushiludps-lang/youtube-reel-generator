@@ -8,6 +8,12 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
 
+# MoviePy v2 effects (for smooth fades)
+try:
+    from moviepy import vfx
+except Exception:
+    vfx = None
+
 # ===============================
 # CONFIG / FOLDERS
 # ===============================
@@ -31,7 +37,6 @@ topic = st.text_input("Topic", "Why does fire have no shadow?")
 
 target_scene_seconds = st.slider("Target seconds per scene", 4, 12, 7)
 
-# NEW: force longer output
 min_video_seconds = st.slider("Minimum video length (seconds)", 10, 60, 30)
 min_scenes = st.slider("Minimum scenes", 2, 12, 6)
 max_scenes = st.slider("Maximum scenes", 3, 20, 10)
@@ -39,6 +44,9 @@ max_scenes = st.slider("Maximum scenes", 3, 20, 10)
 ENABLE_CAPTIONS = st.toggle("Burn captions on images", True)
 CAPTION_FONT_SIZE = st.slider("Caption font size", 42, 84, 64)
 CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
+
+# NEW: smooth transition control
+fade_seconds = st.slider("Smooth transition seconds", 0.2, 1.2, 0.6)
 
 DEBUG = st.toggle("Show debug", False)
 
@@ -122,7 +130,7 @@ def fetch_images(scene_text):
     return paths[:IMAGES_PER_SCENE]
 
 # ===============================
-# LONGER SCRIPT POOL (so TTS is not 8 seconds)
+# LONGER SCRIPT POOL
 # ===============================
 def script_pool(topic: str):
     return [
@@ -136,15 +144,15 @@ def script_pool(topic: str):
         "Try it: flashlight behind a lighter, then look at the wall edge.",
         "If the flame is dim and the background light is strong, shadow becomes clearer.",
         "If the flame is bright, it washes out the shadow contrast.",
-        "Also, moving flames blur edges, which makes shadows look weak.",
+        "Moving flames blur edges, which makes shadows look weak.",
         "So it’s not ‘zero shadow’—it’s usually ‘no crisp shadow’ in normal lighting.",
-        "In a lab demo, you can tune light intensity to make it appear or disappear.",
+        "You can tune light intensity to make it appear or disappear.",
         "That’s the physics: emission + transparency + contrast.",
         "Follow for more quick science reels.",
     ]
 
 # ===============================
-# BUILD SCRIPT UNTIL IT'S LONG ENOUGH
+# BUILD SCRIPT UNTIL LONG ENOUGH
 # ===============================
 def tts_duration_for(script_lines):
     narration = " ".join(script_lines)
@@ -156,25 +164,20 @@ def tts_duration_for(script_lines):
 def build_script(topic, target_scene_sec, min_secs, min_s, max_s):
     pool = script_pool(topic)
 
-    # start with minimum scenes
     n = max(min_s, 2)
     n = min(n, max_s, len(pool))
     script = pool[:n]
 
-    # extend until duration >= min_secs (or hit max scenes)
-    for _ in range(25):
+    for _ in range(30):
         mp3, dur = tts_duration_for(script)
 
-        # also keep scenes roughly near target_scene_seconds (optional)
         scenes_needed = int(round(dur / target_scene_sec))
         scenes_needed = max(min_s, min(max_s, scenes_needed, len(pool)))
 
-        # ensure we meet minimum seconds by adding more lines if needed
         if dur < min_secs and len(script) < max_s and len(script) < len(pool):
             script = pool[:len(script) + 1]
             continue
 
-        # adjust to scenes_needed if it increases scene count (avoid collapsing too much)
         if scenes_needed > len(script):
             script = pool[:scenes_needed]
             continue
@@ -183,6 +186,25 @@ def build_script(topic, target_scene_sec, min_secs, min_s, max_s):
 
     mp3, dur = tts_duration_for(script)
     return script, mp3, dur
+
+# ===============================
+# SMOOTH FADE HELPERS (MoviePy v2 safe)
+# ===============================
+def apply_fades(clip, fsec):
+    if fsec <= 0:
+        return clip
+    if vfx is not None and hasattr(clip, "with_effects"):
+        effs = []
+        if hasattr(vfx, "FadeIn"):
+            effs.append(vfx.FadeIn(fsec))
+        if hasattr(vfx, "FadeOut"):
+            effs.append(vfx.FadeOut(fsec))
+        if effs:
+            try:
+                return clip.with_effects(effs)
+            except Exception:
+                return clip
+    return clip  # if vfx not available, no fades
 
 # ===============================
 # BUILD VIDEO
@@ -196,16 +218,12 @@ if st.button("Generate Final MP4 Reel"):
     scene_duration = audio_duration / scenes
     per_image_duration = scene_duration / IMAGES_PER_SCENE
 
-    if DEBUG:
-        st.write("Audio duration (s):", round(audio_duration, 2))
-        st.write("Scenes:", scenes)
-        st.write("Scene duration (s):", round(scene_duration, 2))
-        st.write("Per image duration (s):", round(per_image_duration, 2))
-
+    # Audio
     audio = AudioFileClip(str(voice_path))
 
     clips = []
     used = 0
+
     for scene_text in script:
         imgs = fetch_images(scene_text)
         if not imgs:
@@ -213,12 +231,27 @@ if st.button("Generate Final MP4 Reel"):
             st.stop()
 
         for img in imgs:
-            clips.append(ImageClip(str(img), duration=per_image_duration))
+            c = ImageClip(str(img), duration=per_image_duration)
+            c = apply_fades(c, fade_seconds)
+            clips.append(c)
             used += 1
 
-    video = concatenate_videoclips(clips, method="compose", padding=0)
+    # Crossfade overlap = fade_seconds (very smooth)
+    # This reduces total duration by overlap, so we compensate by slightly increasing clip durations
+    # so final video matches audio.
 
-    # Trim audio to video duration if slightly longer (prevents drift)
+    overlap = min(fade_seconds, per_image_duration * 0.45)
+    nclips = len(clips)
+    if nclips > 1 and overlap > 0:
+        # compensate duration loss: total_loss = overlap * (nclips - 1)
+        total_loss = overlap * (nclips - 1)
+        add_each = total_loss / nclips
+        clips = [ImageClip(c.filename, duration=c.duration + add_each) for c in clips]  # rebuild clips
+        clips = [apply_fades(c, fade_seconds) for c in clips]
+
+    video = concatenate_videoclips(clips, method="compose", padding=-overlap)
+
+    # Trim audio if slightly longer
     if hasattr(audio, "subclip") and audio.duration > video.duration:
         audio = audio.subclip(0, video.duration)
 
@@ -226,6 +259,13 @@ if st.button("Generate Final MP4 Reel"):
 
     out = VID_DIR / "final_reel.mp4"
     video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
+
+    if DEBUG:
+        st.write("Audio duration (s):", round(audio_duration, 2))
+        st.write("Scenes:", scenes)
+        st.write("Per image duration (s):", round(per_image_duration, 2))
+        st.write("Clips:", len(clips))
+        st.write("Overlap:", overlap)
 
     st.success(f"Done. Length: {video.duration:.1f}s • Scenes: {scenes} • Images: {used}")
     st.video(str(out))
