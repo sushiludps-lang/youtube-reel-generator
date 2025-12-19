@@ -14,10 +14,10 @@ from gtts import gTTS
 # MoviePy import (Cloud + Local compatible)
 # -------------------------------------------------
 try:
-    from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
+    from moviepy import ImageClip, AudioFileClip, concatenate_videoclips, vfx
     MOVIEPY_V2 = True
 except ImportError:
-    from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
+    from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, vfx
     MOVIEPY_V2 = False
 
 # -----------------------
@@ -35,10 +35,10 @@ VID_DIR.mkdir(exist_ok=True)
 # Page setup
 # -----------------------
 st.set_page_config(page_title="Reel Generator", layout="wide", page_icon="🎬")
-st.title("YouTube Reel Generator – Full MP4 Builder (FREE Images)")
+st.title("YouTube Reel Generator – MP4 Builder (More Images + Transitions)")
 
 # -----------------------
-# Secrets + GenAI client
+# Secrets
 # -----------------------
 gemini_key = st.secrets.get("GEMINI_API_KEY", "")
 if not gemini_key:
@@ -53,11 +53,17 @@ TEXT_MODEL = "gemini-2.5-flash"
 # -----------------------
 # UI inputs
 # -----------------------
-topic = st.text_input("Enter a topic for the YouTube Reel", value="Why does fire have no shadow?")
-num_scenes = st.slider("Number of scenes", 5, 10, 7)
+topic = st.text_input("Topic", value="Why does fire have no shadow?")
+num_scenes = st.slider("Scenes (script sections)", 5, 10, 7)
+
+target_seconds = st.slider("Target reel length (seconds)", 40, 75, 60)
+imgs_per_scene = st.slider("Images per scene", 2, 6, 4)
+
+transition_sec = st.slider("Transition (crossfade) seconds", 0, 2, 1)
+enable_kenburns = st.toggle("Enable subtle zoom (Ken Burns)", value=True)
 
 image_source = st.selectbox("Image source", ["Pexels (free key)", "Placeholders only"], index=0)
-show_debug = st.toggle("Show image debug", value=True)
+show_debug = st.toggle("Show image debug", value=False)
 
 if image_source.startswith("Pexels") and not PEXELS_KEY:
     st.warning("PEXELS_API_KEY is missing. Add it in Streamlit Cloud → Manage app → Settings → Secrets.")
@@ -75,8 +81,7 @@ def make_placeholder_image(text: str, idx: int) -> Path:
     img = Image.new("RGB", (1080, 1920), (15, 15, 20))
     draw = ImageDraw.Draw(img)
     font = _load_font(64)
-
-    draw.text((80, 120), f"Scene {idx}", fill=(200, 200, 200), font=font)
+    draw.text((80, 120), f"Clip {idx}", fill=(200, 200, 200), font=font)
 
     words = text.split()
     lines, line = [], ""
@@ -94,33 +99,31 @@ def make_placeholder_image(text: str, idx: int) -> Path:
         draw.text((80, y), ln, fill=(240, 240, 240), font=font)
         y += 90
 
-    out = IMG_DIR / f"scene_{idx}.png"
+    out = IMG_DIR / f"clip_{idx}.png"
     img.save(out)
     return out
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def pexels_search(query: str):
+def pexels_search_urls(query: str, k: int):
     if not PEXELS_KEY:
-        return None, None, "PEXELS_API_KEY missing"
+        return [], None, "PEXELS_API_KEY missing"
 
     headers = {"Authorization": PEXELS_KEY}
     params = {
         "query": query,
-        "per_page": 20,
+        "per_page": 40,
         "orientation": "portrait",
         "size": "large",
     }
     r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=25)
-
     if r.status_code != 200:
-        return None, r.status_code, r.text[:500]
+        return [], r.status_code, r.text[:500]
 
     data = r.json()
     photos = data.get("photos", [])
     if not photos:
-        return None, 200, "No photos found"
+        return [], 200, "No photos found"
 
-    # Prefer portrait URL
     urls = []
     for p in photos:
         src = p.get("src", {})
@@ -130,9 +133,10 @@ def pexels_search(query: str):
             urls.append(src["large"])
 
     if not urls:
-        return None, 200, "Photos returned but no usable src URLs"
+        return [], 200, "No usable src URLs"
 
-    return random.choice(urls), 200, "OK"
+    random.shuffle(urls)
+    return urls[:k], 200, "OK"
 
 def download_and_fit_9x16(img_url: str, out_path: Path):
     r = requests.get(img_url, timeout=30)
@@ -141,11 +145,9 @@ def download_and_fit_9x16(img_url: str, out_path: Path):
 
     target_w, target_h = 1080, 1920
     target_ratio = target_w / target_h
-
     w, h = img.size
     src_ratio = w / h
 
-    # Center crop to 9:16
     if src_ratio > target_ratio:
         new_w = int(h * target_ratio)
         left = (w - new_w) // 2
@@ -158,35 +160,52 @@ def download_and_fit_9x16(img_url: str, out_path: Path):
     img = img.resize((target_w, target_h), Image.LANCZOS)
     img.save(out_path, format="PNG")
 
-def build_image_for_scene(scene_text: str, idx: int):
+def build_images_for_scene(scene_text: str, clip_start_idx: int, k: int):
+    paths = []
     if image_source.startswith("Pexels"):
-        url, status, msg = pexels_search(scene_text)
+        urls, status, msg = pexels_search_urls(scene_text, k)
         if show_debug:
-            with st.expander(f"Pexels debug (Scene {idx})", expanded=False):
-                st.write({"status": status, "message": msg, "url": url})
+            with st.expander(f"Pexels debug ({scene_text[:40]}...)", expanded=False):
+                st.write({"status": status, "message": msg, "count": len(urls)})
+                for u in urls[:5]:
+                    st.write(u)
 
-        if url:
-            out = IMG_DIR / f"scene_{idx}.png"
+        for j, url in enumerate(urls, start=0):
+            out = IMG_DIR / f"clip_{clip_start_idx + j}.png"
             try:
                 download_and_fit_9x16(url, out)
-                return out
-            except Exception as e:
-                if show_debug:
-                    with st.expander(f"Download/crop error (Scene {idx})", expanded=False):
-                        st.write(str(e))
+                paths.append(out)
+            except Exception:
+                continue
 
-    return make_placeholder_image(scene_text, idx)
+    # If not enough urls downloaded, fill with placeholders
+    while len(paths) < k:
+        idx = clip_start_idx + len(paths)
+        paths.append(make_placeholder_image(scene_text, idx))
+
+    return paths
+
+def ken_burns(clip: ImageClip, zoom=1.06):
+    # gentle zoom-in over duration
+    return clip.fx(vfx.resize, lambda t: 1 + (zoom - 1) * (t / clip.duration))
 
 # -----------------------
 # Generate everything
 # -----------------------
 if st.button("Generate Final MP4 Reel", type="primary"):
 
+    # Force shorter scripts (so you don't get 1:27 like before)
     script_prompt = f"""
 Return ONLY valid JSON. No commentary. No markdown. No extra text.
 
 Topic: {topic}
+Total target length: ~{target_seconds} seconds of narration (aim 120–150 words max).
 Scenes: {num_scenes}
+
+Rules:
+- Hook: 1 sentence (<= 12 words)
+- Each scene: 1 short sentence (<= 18 words)
+- CTA: 1 sentence (<= 10 words)
 
 Format EXACTLY:
 {{
@@ -196,20 +215,13 @@ Format EXACTLY:
 }}
 """.strip()
 
-    # Force JSON output
     result = client.models.generate_content(
         model=TEXT_MODEL,
         contents=script_prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
 
-    raw = (getattr(result, "text", "") or "").strip()
-    if not raw:
-        st.error("Gemini returned empty output.")
-        st.stop()
-
-    raw = raw.replace("```json", "").replace("```", "").strip()
-
+    raw = (getattr(result, "text", "") or "").strip().replace("```json", "").replace("```", "").strip()
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -222,31 +234,17 @@ Format EXACTLY:
         st.error("No scenes returned; cannot build video.")
         st.stop()
 
-    st.subheader("Hook")
-    st.success(data.get("hook", ""))
-
-    images = []
-    narration_parts = [data.get("hook", "")]
-
-    st.subheader("Scenes")
-    progress = st.progress(0)
-
-    for i, scene in enumerate(scenes, start=1):
-        scene_text = str(scene)
-        narration_parts.append(scene_text)
-
-        img_path = build_image_for_scene(scene_text, i)
-        images.append(img_path)
-
-        st.write(f"**Scene {i}:** {scene_text}")
-        st.image(str(img_path), use_container_width=True)
-        progress.progress(i / len(scenes))
-
+    hook = data.get("hook", "")
     cta = data.get("cta", "")
-    st.subheader("CTA")
-    st.info(cta)
-    narration_parts.append(cta)
 
+    st.subheader("Script")
+    st.write("**Hook:**", hook)
+    for i, s in enumerate(scenes, 1):
+        st.write(f"**Scene {i}:**", s)
+    st.write("**CTA:**", cta)
+
+    # Build narration
+    narration_parts = [hook] + [str(s) for s in scenes] + [cta]
     narration = ". ".join([p.strip() for p in narration_parts if p and p.strip()]) + "."
 
     # Voiceover
@@ -255,21 +253,48 @@ Format EXACTLY:
     st.subheader("Voiceover Preview")
     st.audio(str(audio_path))
 
-    # Video render
     audio = AudioFileClip(str(audio_path))
-    per_image = max(0.8, audio.duration / len(images))
+
+    # Build many image clips: imgs_per_scene for each scene
+    all_image_paths = []
+    clip_idx = 1
+    for s in scenes:
+        paths = build_images_for_scene(str(s), clip_idx, imgs_per_scene)
+        all_image_paths.extend(paths)
+        clip_idx += imgs_per_scene
+
+    # Duration per image based on audio length
+    per_img = max(0.6, audio.duration / max(1, len(all_image_paths)))
+
+    # Create clips with transitions
+    clips = []
+    for p in all_image_paths:
+        if MOVIEPY_V2:
+            c = ImageClip(str(p), duration=per_img)
+        else:
+            c = ImageClip(str(p)).set_duration(per_img)
+
+        if enable_kenburns:
+            c = ken_burns(c, zoom=1.06)
+
+        # Apply crossfade-in except first clip
+        if transition_sec > 0 and clips:
+            if MOVIEPY_V2:
+                c = c.with_effects([vfx.CrossFadeIn(transition_sec)])
+            else:
+                c = c.crossfadein(transition_sec)
+
+        clips.append(c)
 
     if MOVIEPY_V2:
-        clips = [ImageClip(str(img), duration=per_image) for img in images]
         video = concatenate_videoclips(clips, method="compose").with_audio(audio)
     else:
-        clips = [ImageClip(str(img)).set_duration(per_image) for img in images]
         video = concatenate_videoclips(clips, method="compose").set_audio(audio)
 
     out_video = VID_DIR / "final_reel.mp4"
     video.write_videofile(str(out_video), fps=30, codec="libx264", audio_codec="aac")
 
-    st.success("Final MP4 ready")
+    st.success(f"Final MP4 ready • Images used: {len(all_image_paths)} • Duration: ~{audio.duration:.1f}s")
     st.video(str(out_video))
     st.download_button(
         "Download MP4",
