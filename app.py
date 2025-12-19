@@ -12,18 +12,24 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 
-# MoviePy v2 imports (Streamlit Cloud typically uses v2)
-from moviepy import AudioFileClip, CompositeVideoClip, ImageClip
+# MoviePy (Streamlit Cloud is usually v2)
+from moviepy import AudioFileClip, ImageClip, CompositeVideoClip, concatenate_videoclips
 
-# Force a working ffmpeg on Streamlit Cloud (requires imageio-ffmpeg in requirements.txt)
+# Optional vfx (for smoother fades if available)
 try:
-    import imageio_ffmpeg  # pip package: imageio-ffmpeg
+    from moviepy import vfx  # moviepy v2
+except Exception:
+    vfx = None
+
+# Ensure ffmpeg works on Streamlit Cloud (requires imageio-ffmpeg in requirements.txt)
+try:
+    import imageio_ffmpeg
     os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     pass
 
 # =============================
-# SESSION STATE (MUST BE EARLY)
+# SESSION STATE
 # =============================
 if "topics_text" not in st.session_state:
     st.session_state["topics_text"] = ""
@@ -48,7 +54,10 @@ ENABLE_TOP_TITLE = True
 TITLE_FONT_SIZE = 54
 TITLE_PAD_TOP = 70
 
-# Encode settings (reduces ffmpeg IOErrors on Streamlit Cloud)
+# Transitions (safe)
+FADE_SECONDS = 0.35  # gentle fade-in/out per image (safe, avoids black gaps)
+
+# Encode settings (Streamlit Cloud stability)
 FPS = 30
 FFMPEG_PRESET = "ultrafast"
 FFMPEG_THREADS = 2
@@ -64,25 +73,21 @@ HISTORY_FILE = CACHE_DIR / "topics.json"
 for d in (IMG_DIR, AUD_DIR, VID_DIR, CACHE_DIR):
     d.mkdir(exist_ok=True)
 
-# ====== REQUIRED SECRETS ======
-# Streamlit Cloud -> App -> Settings -> Secrets:
+# ===== REQUIRED SECRET =====
+# Streamlit Cloud -> Settings -> Secrets:
 # PEXELS_API_KEY="..."
 PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
 
 # =============================
-# MOVIEPY v1/v2 COMPAT HELPERS
+# MOVIEPY v1/v2 COMPAT
 # =============================
 def clip_with_duration(c, d):
     return c.with_duration(d) if hasattr(c, "with_duration") else c.set_duration(d)
-
-def clip_with_start(c, t):
-    return c.with_start(t) if hasattr(c, "with_start") else c.set_start(t)
 
 def clip_with_audio(c, a):
     return c.with_audio(a) if hasattr(c, "with_audio") else c.set_audio(a)
 
 def clip_with_fps(c, fps):
-    # v2 has with_fps; v1 uses set_fps
     return c.with_fps(fps) if hasattr(c, "with_fps") else c.set_fps(fps)
 
 # =============================
@@ -108,7 +113,7 @@ def eta_remaining(elapsed, pct):
     return max(0, total_est - elapsed)
 
 # =============================
-# TOPIC HISTORY (NO DUPES)
+# TOPIC HISTORY
 # =============================
 def load_history():
     if HISTORY_FILE.exists():
@@ -165,7 +170,7 @@ def generate_new_topics(n=20):
 def cb_autogen():
     new = generate_new_topics(20)
     if not new:
-        st.session_state["auto_error"] = "No new topics left. Clear topic history or expand the pool."
+        st.session_state["auto_error"] = "No new topics left. Clear history or expand the pool."
         return
     for t in new:
         TOPIC_HISTORY.add(t.lower())
@@ -217,19 +222,13 @@ def script_pool(topic):
     ]
 
 # =============================
-# CAPTION/STYLE HELPERS
+# STYLE HELPERS
 # =============================
 def load_font(size, bold=False):
     candidates = []
     if bold:
-        candidates += [
-            "DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ]
-    candidates += [
-        "DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
+        candidates += ["DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+    candidates += ["DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
     for p in candidates:
         try:
             return ImageFont.truetype(p, size)
@@ -254,47 +253,34 @@ def add_vignette(img):
 def draw_caption(img, caption, topic_title=None):
     img = img.convert("RGB")
     img = add_vignette(img)
-
     draw = ImageDraw.Draw(img)
 
     # Top title pill
     if ENABLE_TOP_TITLE and topic_title:
-        title = topic_title.strip()
-        title_lines = textwrap.wrap(title, width=24)[:2]
+        title_lines = textwrap.wrap(topic_title.strip(), width=24)[:2]
         text = "\n".join(title_lines)
-
         bbox = draw.multiline_textbbox((0, 0), text, font=TITLE_FONT, spacing=10)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-
         x1 = (WIDTH - tw) // 2 - 30
         y1 = TITLE_PAD_TOP
         x2 = (WIDTH + tw) // 2 + 30
         y2 = y1 + th + 24
-
-        # shadow + pill
         rounded_rectangle(draw, (x1 + 6, y1 + 6, x2 + 6, y2 + 6), 28, fill=(0, 0, 0))
         rounded_rectangle(draw, (x1, y1, x2, y2), 28, fill=(12, 12, 14))
         draw.multiline_text((x1 + 30, y1 + 12), text, font=TITLE_FONT, fill=(255, 255, 255), spacing=10)
 
     # Bottom caption card
-    lines = textwrap.wrap(caption.strip(), width=26)[:3]
-    if not lines:
-        lines = [""]
-
+    lines = textwrap.wrap(caption.strip(), width=26)[:3] or [""]
     line_h = CAPTION_FONT_SIZE + CAPTION_LINE_SPACING
     box_h = CAPTION_PADDING_Y * 2 + line_h * len(lines)
 
     y2 = HEIGHT - 120
     y1 = y2 - box_h
+    x1, x2 = 60, WIDTH - 60
 
-    x1 = 60
-    x2 = WIDTH - 60
-
-    # shadow + card
     rounded_rectangle(draw, (x1 + 8, y1 + 10, x2 + 8, y2 + 10), CAPTION_BOX_RADIUS, fill=(0, 0, 0))
     rounded_rectangle(draw, (x1, y1, x2, y2), CAPTION_BOX_RADIUS, fill=(12, 12, 14))
 
-    # text
     y = y1 + CAPTION_PADDING_Y
     for line in lines:
         draw.text((x1 + CAPTION_PADDING_X, y), line, font=CAPTION_FONT, fill=(255, 255, 255))
@@ -303,54 +289,79 @@ def draw_caption(img, caption, topic_title=None):
     return img
 
 # =============================
-# PEXELS
+# IMAGE FETCH (ROBUST) + PLACEHOLDER
 # =============================
+def make_placeholder_image(text, out_path, topic_title):
+    img = Image.new("RGB", (WIDTH, HEIGHT), (18, 18, 22))
+    img = add_vignette(img)
+    img = draw_caption(img, text, topic_title=topic_title)
+    img.save(out_path, quality=95)
+    return out_path
+
+def download_image_bytes(url):
+    # Pexels sometimes needs a User-Agent; also handle 403/429 cleanly
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    r = requests.get(url, headers=headers, timeout=25)
+    if r.status_code != 200 or not r.content:
+        raise RuntimeError(f"Image download failed ({r.status_code})")
+    return r.content
+
 def pexels_images(query):
-    headers = {"Authorization": PEXELS_API_KEY}
+    headers = {"Authorization": PEXELS_API_KEY, "User-Agent": "Mozilla/5.0"}
     params = {"query": query, "per_page": 20, "orientation": "portrait"}
     r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=25)
     r.raise_for_status()
     return r.json().get("photos", [])
 
 def prepare_image(url, caption, out_path, topic_title):
-    out_path.write_bytes(requests.get(url, timeout=25).content)
-    img = Image.open(out_path).convert("RGB")
-    img = ImageOps.exif_transpose(img)
-    img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
-
-    img = draw_caption(img, caption, topic_title=topic_title)
-
-    img.save(out_path, quality=95)
-    return out_path
+    try:
+        out_path.write_bytes(download_image_bytes(url))
+        img = Image.open(out_path).convert("RGB")
+        img = ImageOps.exif_transpose(img)
+        img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+        img = draw_caption(img, caption, topic_title=topic_title)
+        img.save(out_path, quality=95)
+        return out_path
+    except Exception:
+        # If anything fails (Pexels blocked / 429 / corrupt), fallback so video never goes blank
+        return make_placeholder_image(caption, out_path, topic_title=topic_title)
 
 # =============================
-# VIDEO BUILDER (SYNCED, STABLE)
+# VIDEO BUILDER (NO BLANK VIDEO)
 # =============================
-def build_video(images, audio_path, crossfade=0.6):
+def apply_safe_fade(clip, fade_s):
+    """
+    Adds subtle fades if supported by installed MoviePy.
+    If not supported, returns original clip (no crash).
+    """
+    if vfx is None:
+        return clip
+    try:
+        # moviepy v2 effects
+        clip = clip.with_effects([vfx.FadeIn(fade_s), vfx.FadeOut(fade_s)])
+        return clip
+    except Exception:
+        return clip
+
+def build_video(images, audio_path):
     audio = AudioFileClip(str(audio_path))
     dur = float(audio.duration)
 
     n = max(1, len(images))
-    overlap = max(0.2, min(crossfade, 1.2))
-
-    # Ensure total duration matches audio:
-    # total = n*D - (n-1)*overlap = dur  => D = (dur + (n-1)*overlap)/n
-    D = (dur + (n - 1) * overlap) / n
-    step = D - overlap
+    per_img = dur / n
 
     clips = []
-    for i, img in enumerate(images):
+    for img in images:
         c = ImageClip(str(img))
-        c = clip_with_duration(c, D)
-
-        start_t = 0.0 if i == 0 else i * step
-        c = clip_with_start(c, start_t)
-
-        # Note: true crossfade requires masks/effects which are inconsistent across MoviePy versions.
-        # This overlap layout is stable and avoids black frames.
+        c = clip_with_duration(c, per_img)
+        c = apply_safe_fade(c, min(FADE_SECONDS, per_img / 3))
         clips.append(c)
 
-    video = CompositeVideoClip(clips, size=(WIDTH, HEIGHT))
+    # Concatenate is the most reliable way to avoid "black/blank" on Streamlit Cloud
+    video = concatenate_videoclips(clips, method="compose")
     video = clip_with_duration(video, dur)
     video = clip_with_audio(video, audio)
     video = clip_with_fps(video, FPS)
@@ -359,7 +370,7 @@ def build_video(images, audio_path, crossfade=0.6):
 # =============================
 # BUILD ONE REEL (WITH % + ETA)
 # =============================
-def build_reel(topic, idx, progress_cb=None, pexels_delay=0.25, crossfade=0.6):
+def build_reel(topic, idx, progress_cb=None, pexels_delay=0.25):
     start = time.time()
 
     def cb(p, msg):
@@ -367,9 +378,7 @@ def build_reel(topic, idx, progress_cb=None, pexels_delay=0.25, crossfade=0.6):
             elapsed = time.time() - start
             progress_cb(p, msg, elapsed)
 
-    W_SCRIPT = 0.15
-    W_IMAGES = 0.55
-    W_RENDER = 0.30
+    W_SCRIPT, W_IMAGES, W_RENDER = 0.15, 0.55, 0.30
 
     cb(0.01, "Generating script + narration...")
     script = script_pool(topic)
@@ -387,20 +396,25 @@ def build_reel(topic, idx, progress_cb=None, pexels_delay=0.25, crossfade=0.6):
         cb(W_SCRIPT + W_IMAGES * p_scene, f"Images {si}/{total_scenes}...")
 
         photos = pexels_images(scene_text)
+
+        # If API returns nothing, use placeholders (still produces a video with images)
         if not photos:
-            raise RuntimeError(f"Pexels returned 0 images for: {scene_text}")
+            for j in range(1, IMAGES_PER_SCENE + 1):
+                out_path = IMG_DIR / f"reel{idx}_scene{si}_img{j}_placeholder.jpg"
+                images.append(make_placeholder_image(scene_text, out_path, topic_title=topic))
+            continue
 
         picks = photos[:IMAGES_PER_SCENE]
         for j, p in enumerate(picks, start=1):
-            url = p["src"].get("portrait") or p["src"].get("large2x") or p["src"].get("large")
+            src = p.get("src", {})
+            url = src.get("portrait") or src.get("large2x") or src.get("large")
             out_path = IMG_DIR / f"reel{idx}_scene{si}_img{j}_{abs(hash(url))}.jpg"
-            prepare_image(url, scene_text, out_path, topic_title=topic)
-            images.append(out_path)
+            images.append(prepare_image(url, scene_text, out_path, topic_title=topic))
 
         time.sleep(pexels_delay)
 
     cb(W_SCRIPT + W_IMAGES, "Rendering MP4...")
-    video = build_video(images, audio_path, crossfade=crossfade)
+    video = build_video(images, audio_path)
 
     out = VID_DIR / f"reel_{idx:02d}_{slugify(topic)}.mp4"
     cb(W_SCRIPT + W_IMAGES + W_RENDER * 0.5, "Encoding...")
@@ -419,7 +433,6 @@ def build_reel(topic, idx, progress_cb=None, pexels_delay=0.25, crossfade=0.6):
             logger=None,
         )
     finally:
-        # Close to prevent ffmpeg broken pipe / resource issues
         try:
             video.close()
         except Exception:
@@ -431,12 +444,11 @@ def build_reel(topic, idx, progress_cb=None, pexels_delay=0.25, crossfade=0.6):
 # =============================
 # UI
 # =============================
-st.title("YouTube Reel Generator — Beautiful Captions + Progress + Batch")
+st.title("YouTube Reel Generator — Images + Beautiful Captions + Progress")
 
 mode = st.radio("Mode", ["Single", "Batch (20)"], horizontal=True)
 
 pexels_delay = st.slider("Delay between Pexels calls (seconds)", 0.0, 1.5, 0.25)
-crossfade_seconds = st.slider("Smooth transition overlap (seconds)", 0.2, 1.2, 0.6)
 
 def show_eta(elapsed, p):
     return fmt_time(eta_remaining(elapsed, p))
@@ -454,17 +466,10 @@ if mode == "Single":
             reel_status.write(f"{int(p*100)}% — {msg}")
             reel_eta.write(f"ETA: {show_eta(elapsed, p)}")
 
-        try:
-            mp4, _dt = build_reel(topic, 1, progress_cb=cb, pexels_delay=pexels_delay, crossfade=crossfade_seconds)
-            st.success("Done.")
-            st.video(str(mp4))
-            st.download_button("Download MP4", open(mp4, "rb"), mp4.name, mime="video/mp4")
-        except OSError:
-            st.error(
-                "FFmpeg failed while writing the video. Fix this by adding "
-                "`imageio-ffmpeg` to requirements.txt and rebooting the app."
-            )
-            st.stop()
+        mp4, _dt = build_reel(topic, 1, progress_cb=cb, pexels_delay=pexels_delay)
+        st.success("Done.")
+        st.video(str(mp4))
+        st.download_button("Download MP4", open(mp4, "rb"), mp4.name, mime="video/mp4")
 
 else:
     col1, col2 = st.columns([2, 1], vertical_alignment="top")
@@ -503,13 +508,9 @@ else:
                 reel_txt.write(f"Reel {i}/{len(topics)} — {int(p*100)}% — {t}")
                 reel_eta.write(f"Reel ETA: {show_eta(elapsed, p)} — {msg}")
 
-            try:
-                out, dt = build_reel(t, i, progress_cb=cb, pexels_delay=pexels_delay, crossfade=crossfade_seconds)
-                outputs.append(out)
-                times.append(dt)
-            except OSError:
-                st.error("FFmpeg failed mid-batch. Add `imageio-ffmpeg` to requirements.txt and reboot.")
-                st.stop()
+            out, dt = build_reel(t, i, progress_cb=cb, pexels_delay=pexels_delay)
+            outputs.append(out)
+            times.append(dt)
 
             overall_bar.progress(int(i / len(topics) * 100))
             overall_txt.write(f"Batch progress: {i}/{len(topics)} reels completed")
