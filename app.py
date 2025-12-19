@@ -9,7 +9,7 @@ from pathlib import Path
 import requests
 import streamlit as st
 from gtts import gTTS
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 from moviepy import AudioFileClip, CompositeVideoClip, ImageClip
 
 # =============================
@@ -26,9 +26,17 @@ if "auto_error" not in st.session_state:
 WIDTH, HEIGHT = 1080, 1920
 IMAGES_PER_SCENE = 2
 
-CAPTION_FONT_SIZE = 64        # 🔥 FIXED: large readable captions
-CAPTION_LINE_SPACING = 12
-CAPTION_PADDING = 60
+# Captions (big + modern)
+CAPTION_FONT_SIZE = 72
+CAPTION_LINE_SPACING = 14
+CAPTION_PADDING_X = 70
+CAPTION_PADDING_Y = 55
+CAPTION_BOX_RADIUS = 40
+
+# UI theme elements
+ENABLE_TOP_TITLE = True
+TITLE_FONT_SIZE = 52
+TITLE_PAD_TOP = 70
 
 BASE = Path(__file__).parent
 IMG_DIR = BASE / "images"
@@ -63,14 +71,28 @@ def slugify(t):
 def fmt_time(s):
     s = int(max(0, s))
     m, s = divmod(s, 60)
-    return f"{m}m {s}s" if m else f"{s}s"
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+def eta_remaining(elapsed, pct):
+    if pct <= 0:
+        return 0
+    total_est = elapsed / pct
+    return max(0, total_est - elapsed)
 
 # =============================
 # TOPIC HISTORY
 # =============================
 def load_history():
     if HISTORY_FILE.exists():
-        return set(json.loads(HISTORY_FILE.read_text()))
+        try:
+            return set(json.loads(HISTORY_FILE.read_text()))
+        except Exception:
+            return set()
     return set()
 
 def save_history(h):
@@ -97,6 +119,11 @@ TOPIC_POOL = [
     "Why does lightning strike tall objects?",
     "Why does the sky look blue?",
     "Why does food taste different on airplanes?",
+    "Why do we blink?",
+    "Why does soda fizz?",
+    "Why do magnets stick to some metals?",
+    "Why do we feel dizzy after spinning?",
+    "Why do we get static shocks in winter?",
 ]
 
 def generate_new_topics(n=20):
@@ -115,12 +142,18 @@ def generate_new_topics(n=20):
 def cb_autogen():
     new = generate_new_topics(20)
     if not new:
-        st.session_state["auto_error"] = "No new topics left."
+        st.session_state["auto_error"] = "No new topics left. Clear history or expand the pool."
         return
     for t in new:
         TOPIC_HISTORY.add(t.lower())
     save_history(TOPIC_HISTORY)
     st.session_state["topics_text"] = "\n".join(new)
+    st.session_state["auto_error"] = ""
+
+def cb_clear_history():
+    TOPIC_HISTORY.clear()
+    save_history(TOPIC_HISTORY)
+    st.session_state["topics_text"] = ""
     st.session_state["auto_error"] = ""
 
 # =============================
@@ -132,140 +165,302 @@ def script_pool(topic):
     if "hiccup" in t:
         return [
             "Why do hiccups happen?",
-            "Hiccups start when the diaphragm suddenly contracts.",
-            "This pulls air in quickly.",
-            "The vocal cords snap shut, making the hic sound.",
-            "Eating fast or soda often triggers hiccups.",
-            "They usually stop on their own.",
-            "That’s the biology behind hiccups.",
+            "Your diaphragm suddenly contracts.",
+            "Air rushes in fast.",
+            "Your vocal cords snap shut—‘hic!’",
+            "Triggers: eating fast, soda, temperature shifts.",
+            "Most stop on their own in minutes.",
+            "Breath-holding raises CO₂ and may help.",
+            "That’s the quick biology of hiccups.",
         ]
 
     if "fire" in t and "shadow" in t:
         return [
             "Why does fire have no shadow?",
             "A shadow forms when light is blocked.",
-            "Fire emits light instead of blocking it.",
-            "Flames are glowing gases.",
-            "This fills the shadow region.",
-            "That’s why fire has no sharp shadow.",
+            "But fire emits light instead of blocking it.",
+            "Flames are glowing gases and hot particles.",
+            "That added light fills the dark region.",
+            "So the shadow is weak or blurry, not sharp.",
+            "Try a bright flashlight behind a flame to force a shadow.",
         ]
 
     return [
         topic,
         "This happens due to a simple scientific mechanism.",
-        "It depends on how energy moves.",
-        "Once broken down, it becomes clear.",
-        "Science explains what we observe.",
+        "It depends on how energy moves in the system.",
+        "Once you break it down, it becomes intuitive.",
+        "Follow for more quick science reels.",
     ]
 
 # =============================
-# CAPTIONED IMAGE (FIXED SIZE)
+# IMAGE + CAPTION STYLING (BEAUTIFUL)
 # =============================
-def prepare_image(url, caption, out_path):
-    out_path.write_bytes(requests.get(url, timeout=20).content)
+def load_font(size, bold=False):
+    # Streamlit Cloud often has DejaVu fonts available
+    candidates = []
+    if bold:
+        candidates += ["DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+    candidates += ["DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+    for p in candidates:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+CAPTION_FONT = load_font(CAPTION_FONT_SIZE, bold=True)
+TITLE_FONT = load_font(TITLE_FONT_SIZE, bold=True)
+
+def rounded_rectangle(draw, xy, radius, fill):
+    x1, y1, x2, y2 = xy
+    draw.rounded_rectangle([x1, y1, x2, y2], radius=radius, fill=fill)
+
+def add_vignette(img):
+    # subtle vignette for depth
+    overlay = Image.new("L", img.size, 0)
+    d = ImageDraw.Draw(overlay)
+    d.ellipse([-WIDTH*0.25, -HEIGHT*0.15, WIDTH*1.25, HEIGHT*1.15], fill=255)
+    overlay = overlay.filter(ImageFilter.GaussianBlur(90))
+    vignette = ImageOps.invert(overlay)
+    img = Image.composite(img, Image.new("RGB", img.size, (0, 0, 0)), vignette.point(lambda p: p * 0.35))
+    return img
+
+def draw_caption(img, caption, topic_title=None):
+    img = img.convert("RGB")
+    img = add_vignette(img)
+
+    draw = ImageDraw.Draw(img)
+
+    # Top title pill
+    if ENABLE_TOP_TITLE and topic_title:
+        title = topic_title.strip()
+        title_lines = textwrap.wrap(title, width=24)[:2]
+        text = "\n".join(title_lines)
+
+        # measure
+        bbox = draw.multiline_textbbox((0, 0), text, font=TITLE_FONT, spacing=10)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+        x1 = (WIDTH - tw) // 2 - 30
+        y1 = TITLE_PAD_TOP
+        x2 = (WIDTH + tw) // 2 + 30
+        y2 = y1 + th + 24
+
+        rounded_rectangle(draw, (x1, y1, x2, y2), 28, fill=(0, 0, 0))
+        draw.multiline_text((x1 + 30, y1 + 12), text, font=TITLE_FONT, fill=(255, 255, 255), spacing=10)
+
+    # Bottom caption box
+    lines = textwrap.wrap(caption.strip(), width=26)[:3]
+    if not lines:
+        lines = [""]
+
+    line_h = CAPTION_FONT_SIZE + CAPTION_LINE_SPACING
+    box_h = CAPTION_PADDING_Y * 2 + line_h * len(lines)
+    y2 = HEIGHT - 120
+    y1 = y2 - box_h
+
+    x1 = 60
+    x2 = WIDTH - 60
+
+    # shadow
+    rounded_rectangle(draw, (x1 + 6, y1 + 8, x2 + 6, y2 + 8), CAPTION_BOX_RADIUS, fill=(0, 0, 0))
+    # box
+    rounded_rectangle(draw, (x1, y1, x2, y2), CAPTION_BOX_RADIUS, fill=(10, 10, 12))
+
+    # text
+    y = y1 + CAPTION_PADDING_Y
+    for line in lines:
+        draw.text((x1 + CAPTION_PADDING_X, y), line, font=CAPTION_FONT, fill=(255, 255, 255))
+        y += line_h
+
+    return img
+
+# =============================
+# PEXELS
+# =============================
+def pexels_images(query):
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {"query": query, "per_page": 20, "orientation": "portrait"}
+    r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=25)
+    r.raise_for_status()
+    return r.json().get("photos", [])
+
+def prepare_image(url, caption, out_path, topic_title):
+    out_path.write_bytes(requests.get(url, timeout=25).content)
     img = Image.open(out_path).convert("RGB")
     img = ImageOps.exif_transpose(img)
     img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 
-    draw = ImageDraw.Draw(img)
-
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", CAPTION_FONT_SIZE)
-    except:
-        font = ImageFont.load_default()
-
-    lines = textwrap.wrap(caption, width=28)
-    line_h = CAPTION_FONT_SIZE + CAPTION_LINE_SPACING
-    box_h = CAPTION_PADDING * 2 + line_h * len(lines)
-
-    y1 = HEIGHT - box_h - 120
-    draw.rectangle([(0, y1), (WIDTH, HEIGHT)], fill=(0, 0, 0))
-
-    y = y1 + CAPTION_PADDING
-    for line in lines:
-        draw.text((60, y), line, fill="white", font=font)
-        y += line_h
+    img = draw_caption(img, caption, topic_title=topic_title)
 
     img.save(out_path, quality=95)
     return out_path
 
 # =============================
-# VIDEO BUILDER
+# VIDEO BUILDER (SYNCED, NO STUTTER)
 # =============================
-def build_video(images, audio_path):
+def build_video(images, audio_path, crossfade=0.6):
     audio = AudioFileClip(str(audio_path))
-    dur = audio.duration
-    per_img = dur / len(images)
+    dur = float(audio.duration)
+
+    n = max(1, len(images))
+    overlap = max(0.2, min(crossfade, 1.2))
+    D = (dur + (n - 1) * overlap) / n
+    step = D - overlap
 
     clips = []
     for i, img in enumerate(images):
         c = ImageClip(str(img))
-        c = clip_with_duration(c, per_img)
-        c = clip_with_start(c, i * per_img)
+        c = clip_with_duration(c, D)
+
+        start_t = 0.0 if i == 0 else i * step
+        c = clip_with_start(c, start_t)
         clips.append(c)
 
     video = CompositeVideoClip(clips, size=(WIDTH, HEIGHT))
+    video = clip_with_duration(video, dur)
     video = clip_with_audio(video, audio)
     return video
 
 # =============================
-# BUILD ONE REEL
+# BUILD ONE REEL (WITH % + ETA)
 # =============================
-def build_reel(topic, idx, cb=None):
-    script = script_pool(topic)
+def build_reel(topic, idx, progress_cb=None, pexels_delay=0.25, crossfade=0.6):
+    start = time.time()
 
+    def cb(p, msg):
+        if progress_cb:
+            elapsed = time.time() - start
+            progress_cb(p, msg, elapsed)
+
+    W_SCRIPT = 0.15
+    W_IMAGES = 0.55
+    W_RENDER = 0.30
+
+    cb(0.01, "Generating script + narration...")
+    script = script_pool(topic)
     narration = " ".join(script)
+
     audio_path = AUD_DIR / f"voice_{idx}.mp3"
-    gTTS(narration).save(audio_path)
+    gTTS(narration).save(str(audio_path))
+    cb(W_SCRIPT, "Narration ready. Fetching images...")
 
     images = []
-    for s in script:
-        photos = requests.get(
-            "https://api.pexels.com/v1/search",
-            headers={"Authorization": PEXELS_API_KEY},
-            params={"query": s, "per_page": 10, "orientation": "portrait"},
-        ).json()["photos"]
+    total_scenes = len(script)
 
-        for p in photos[:IMAGES_PER_SCENE]:
-            url = p["src"]["portrait"]
-            out = IMG_DIR / f"{idx}_{abs(hash(url))}.jpg"
-            images.append(prepare_image(url, s, out))
-        time.sleep(0.25)
+    for si, scene_text in enumerate(script, start=1):
+        p_scene = (si - 1) / max(1, total_scenes)
+        cb(W_SCRIPT + W_IMAGES * p_scene, f"Images {si}/{total_scenes}...")
 
-    video = build_video(images, audio_path)
-    out = VID_DIR / f"reel_{idx}_{slugify(topic)}.mp4"
+        photos = pexels_images(scene_text)
+        if not photos:
+            raise RuntimeError(f"Pexels returned 0 images for: {scene_text}")
+
+        picks = photos[:IMAGES_PER_SCENE]
+        for j, p in enumerate(picks, start=1):
+            url = p["src"].get("portrait") or p["src"].get("large2x") or p["src"].get("large")
+            out_path = IMG_DIR / f"reel{idx}_scene{si}_img{j}_{abs(hash(url))}.jpg"
+            prepare_image(url, scene_text, out_path, topic_title=topic)
+            images.append(out_path)
+
+        time.sleep(pexels_delay)
+
+    cb(W_SCRIPT + W_IMAGES, "Rendering MP4...")
+    video = build_video(images, audio_path, crossfade=crossfade)
+
+    out = VID_DIR / f"reel_{idx:02d}_{slugify(topic)}.mp4"
+    cb(W_SCRIPT + W_IMAGES + W_RENDER * 0.5, "Encoding...")
     video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
-    return out
+
+    cb(1.0, "Done.")
+    return out, time.time() - start
 
 # =============================
 # UI
 # =============================
-st.title("YouTube Reel Generator (Captions Fixed)")
+st.title("YouTube Reel Generator — Beautiful Captions + Progress + Batch")
 
 mode = st.radio("Mode", ["Single", "Batch (20)"], horizontal=True)
 
+pexels_delay = st.slider("Delay between Pexels calls (seconds)", 0.0, 1.5, 0.25)
+crossfade_seconds = st.slider("Smooth transition (crossfade seconds)", 0.2, 1.2, 0.6)
+
+def show_eta(elapsed, p):
+    return fmt_time(eta_remaining(elapsed, p))
+
 if mode == "Single":
     topic = st.text_input("Topic", "Why do hiccups happen?")
+
     if st.button("Generate Reel"):
-        mp4 = build_reel(topic, 1)
+        reel_bar = st.progress(0)
+        reel_status = st.empty()
+        reel_eta = st.empty()
+
+        def cb(p, msg, elapsed):
+            reel_bar.progress(int(p * 100))
+            reel_status.write(f"{int(p*100)}% — {msg}")
+            reel_eta.write(f"ETA: {show_eta(elapsed, p)}")
+
+        mp4, _dt = build_reel(topic, 1, progress_cb=cb, pexels_delay=pexels_delay, crossfade=crossfade_seconds)
+        st.success("Done.")
         st.video(str(mp4))
-        st.download_button("Download MP4", open(mp4, "rb"), mp4.name)
+        st.download_button("Download MP4", open(mp4, "rb"), mp4.name, mime="video/mp4")
 
 else:
-    st.text_area("Topics (one per line)", key="topics_text", height=260)
-    st.button("Auto-generate 20 topics", on_click=cb_autogen)
+    col1, col2 = st.columns([2, 1], vertical_alignment="top")
+
+    with col1:
+        st.text_area("Topics (one per line)", key="topics_text", height=280)
+        if st.session_state["auto_error"]:
+            st.error(st.session_state["auto_error"])
+
+    with col2:
+        st.subheader("Auto topics")
+        st.button("Auto-generate 20 topics", on_click=cb_autogen)
+        st.button("Clear topic history", on_click=cb_clear_history)
+        st.caption(f"Remembered topics: {len(TOPIC_HISTORY)}")
 
     if st.button("Generate 20 Reels"):
-        topics = [t for t in st.session_state["topics_text"].splitlines() if t][:20]
+        topics = [t.strip() for t in st.session_state["topics_text"].splitlines() if t.strip()][:20]
+        if not topics:
+            st.error("Add topics or click Auto-generate first.")
+            st.stop()
+
+        overall_bar = st.progress(0)
+        overall_txt = st.empty()
+        overall_eta = st.empty()
+
         outputs = []
+        times = []
 
-        for i, t in enumerate(topics, 1):
-            outputs.append(build_reel(t, i))
+        for i, t in enumerate(topics, start=1):
+            reel_bar = st.progress(0)
+            reel_txt = st.empty()
+            reel_eta = st.empty()
 
-        zip_path = VID_DIR / "batch.zip"
-        with zipfile.ZipFile(zip_path, "w") as z:
+            def cb(p, msg, elapsed, i=i, t=t):
+                reel_bar.progress(int(p * 100))
+                reel_txt.write(f"Reel {i}/{len(topics)} — {int(p*100)}% — {t}")
+                reel_eta.write(f"Reel ETA: {show_eta(elapsed, p)} — {msg}")
+
+            out, dt = build_reel(t, i, progress_cb=cb, pexels_delay=pexels_delay, crossfade=crossfade_seconds)
+            outputs.append(out)
+            times.append(dt)
+
+            overall_bar.progress(int(i / len(topics) * 100))
+            overall_txt.write(f"Batch progress: {i}/{len(topics)} reels completed")
+
+            avg = sum(times) / len(times)
+            remaining = avg * (len(topics) - i)
+            overall_eta.write(f"Batch ETA remaining: {fmt_time(remaining)} (avg/reel {fmt_time(avg)})")
+
+        zip_path = VID_DIR / "reels_batch.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
             for p in outputs:
-                z.write(p, p.name)
+                z.write(p, arcname=p.name)
 
-        st.download_button("Download ZIP", open(zip_path, "rb"), "reels.zip")
-        st.video(str(outputs[0]))
+        st.success("Batch complete.")
+        st.download_button("Download ZIP (all MP4s)", open(zip_path, "rb"), zip_path.name, mime="application/zip")
+        if outputs:
+            st.video(str(outputs[0]))
