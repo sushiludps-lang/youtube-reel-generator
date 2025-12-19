@@ -6,9 +6,10 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# ✅ MoviePy v2 imports (IMPORTANT)
+# MoviePy v2 compatible imports
 from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
-from moviepy.audio.fx.speedx import speedx
+from moviepy.audio.AudioClip import AudioArrayClip
+import numpy as np
 
 # ===============================
 # CONFIG
@@ -18,7 +19,6 @@ BASE = Path(__file__).parent
 IMG_DIR = BASE / "images"
 AUD_DIR = BASE / "audio"
 VID_DIR = BASE / "video"
-
 for d in (IMG_DIR, AUD_DIR, VID_DIR):
     d.mkdir(exist_ok=True)
 
@@ -44,7 +44,7 @@ ENABLE_CAPTIONS = st.toggle("Burn captions on video", True)
 CAPTION_FONT_SIZE = st.slider("Caption font size", 42, 84, 64)
 CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 
-show_debug = st.toggle("Show debug")
+DEBUG = st.toggle("Show debug", False)
 
 # ===============================
 # SCRIPT (fixed 6 scenes)
@@ -62,26 +62,21 @@ def build_script(topic):
 script = build_script(topic)
 
 # ===============================
-# FONT LOADER
+# FONT LOADER (cloud-safe)
 # ===============================
 def load_font(size):
-    paths = [
+    candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
-    for p in paths:
+    for p in candidates:
         try:
             return ImageFont.truetype(p, size)
         except Exception:
             pass
     return ImageFont.load_default()
 
-FONT = load_font(CAPTION_FONT_SIZE)
-
-# ===============================
-# CAPTION DRAW
-# ===============================
-def burn_caption(img, caption):
+def burn_caption(img, caption, font):
     img = img.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -93,54 +88,58 @@ def burn_caption(img, caption):
     y1 = HEIGHT - box_h - 120
     y2 = HEIGHT - 120
 
-    draw.rectangle(
-        [(60, y1), (WIDTH - 60, y2)],
-        fill=(0, 0, 0, CAPTION_BOX_OPACITY),
-    )
+    draw.rectangle([(60, y1), (WIDTH - 60, y2)],
+                   fill=(0, 0, 0, int(CAPTION_BOX_OPACITY)))
 
     y = y1 + 35
     for line in lines:
-        draw.text((90, y), line, font=FONT, fill=(255, 255, 255, 255))
+        draw.text((90, y), line, font=font, fill=(255, 255, 255, 255))
         y += line_h
 
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 # ===============================
-# PEXELS FETCH (2 images per scene)
+# PEXELS FETCH (exactly 2 images/scene)
 # ===============================
-def fetch_images(query):
+def fetch_images(scene_text, font):
     headers = {"Authorization": PEXELS_API_KEY}
     params = {
-        "query": query,
-        "per_page": 20,
+        "query": scene_text,
+        "per_page": 30,
         "orientation": "portrait",
         "size": "large",
     }
     r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=20)
     r.raise_for_status()
-
     photos = r.json().get("photos", [])
+
     paths = []
-
     for i, p in enumerate(photos[:IMAGES_PER_SCENE]):
-        url = p["src"].get("portrait")
-        img_path = IMG_DIR / f"{abs(hash((query, i)))}.jpg"
+        url = p["src"].get("portrait") or p["src"].get("large")
+        if not url:
+            continue
 
+        img_path = IMG_DIR / f"img_{abs(hash((scene_text, i)))}.jpg"
         data = requests.get(url, timeout=20).content
-        img = Image.open(Path(img_path).write_bytes(data) or img_path).convert("RGB")
+        img_path.write_bytes(data)
+
+        img = Image.open(img_path).convert("RGB")
         img = ImageOps.exif_transpose(img)
         img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 
         if ENABLE_CAPTIONS:
-            img = burn_caption(img, query)
+            img = burn_caption(img, scene_text, font)
 
         img.save(img_path, quality=95)
         paths.append(img_path)
 
+    if not paths:
+        return []
+
     while len(paths) < IMAGES_PER_SCENE:
         paths.append(paths[-1])
 
-    return paths
+    return paths[:IMAGES_PER_SCENE]
 
 # ===============================
 # ZOOM
@@ -151,42 +150,76 @@ def apply_zoom(clip):
     return clip.resize(lambda t: 1 + (ZOOM_STRENGTH - 1) * (t / clip.duration))
 
 # ===============================
+# AUDIO FIT: pad or trim to 60s (NO speedx needed)
+# ===============================
+def fit_audio_to_duration(audio: AudioFileClip, target_seconds: float) -> AudioFileClip:
+    if audio.duration >= target_seconds:
+        return audio.subclip(0, target_seconds)
+
+    # pad silence to reach target
+    sr = 44100
+    missing = target_seconds - audio.duration
+    n = int(sr * missing)
+    silence = np.zeros((n, 2), dtype=np.float32)  # stereo
+    silence_clip = AudioArrayClip(silence, fps=sr)
+    return concatenate_audios([audio, silence_clip]).subclip(0, target_seconds)
+
+def concatenate_audios(clips):
+    # moviepy v2: easiest is to convert to AudioClip list with concatenation via VideoClip trick
+    # We'll just use AudioArrayClip join:
+    arrays = []
+    fps = 44100
+    for c in clips:
+        if hasattr(c, "fps") and c.fps:
+            fps = c.fps
+        arr = c.to_soundarray(fps=fps)
+        arrays.append(arr)
+    joined = np.vstack(arrays)
+    return AudioArrayClip(joined, fps=fps)
+
+# ===============================
 # BUILD VIDEO
 # ===============================
 if st.button("Generate Final MP4 Reel"):
     st.info("Generating 60s reel…")
 
+    # Voiceover
     narration = " ".join(script)
     audio_path = AUD_DIR / "voice.mp3"
-    gTTS(narration).save(audio_path)
-
+    gTTS(narration).save(str(audio_path))
     audio = AudioFileClip(str(audio_path))
-    factor = audio.duration / TARGET_SECONDS
-    audio = speedx(audio, factor=factor).subclip(0, TARGET_SECONDS)
+    audio = fit_audio_to_duration(audio, TARGET_SECONDS)
 
+    # Visuals: 6 scenes × 2 images = 12 images, 5s each
+    per_image_dur = SCENE_SECONDS / IMAGES_PER_SCENE  # 5 seconds
+
+    font = load_font(CAPTION_FONT_SIZE)
     clips = []
-    per_image_dur = SCENE_SECONDS / IMAGES_PER_SCENE  # 5s
+    used_images = 0
 
     for scene in script:
-        for img in fetch_images(scene):
-            c = ImageClip(str(img)).with_duration(per_image_dur)
+        imgs = fetch_images(scene, font)
+        if not imgs:
+            st.error("No images fetched. Check PEXELS_API_KEY or try a different topic.")
+            st.stop()
+
+        for img in imgs:
+            c = ImageClip(str(img), duration=per_image_dur)
             c = apply_zoom(c)
             clips.append(c)
+            used_images += 1
 
-    video = concatenate_videoclips(
-        clips,
-        method="compose",
-        padding=-TRANSITION_SEC
-    ).with_audio(audio)
+    video = concatenate_videoclips(clips, method="compose", padding=-TRANSITION_SEC)
+    video = video.with_audio(audio)
 
     out = VID_DIR / "final_reel.mp4"
     video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
 
-    if show_debug:
-        st.write("Audio:", audio.duration)
-        st.write("Video:", video.duration)
+    if DEBUG:
+        st.write("Audio duration:", round(audio.duration, 2))
+        st.write("Video duration:", round(video.duration, 2))
+        st.write("Images used:", used_images)
 
-    st.success("Final MP4 ready (audio + captions perfectly synced)")
+    st.success("Done.")
     st.video(str(out))
-    st.download_button("Download MP4", open(out, "rb"), "reel.mp4")
-
+    st.download_button("Download MP4", open(out, "rb"), "reel.mp4", mime="video/mp4")
