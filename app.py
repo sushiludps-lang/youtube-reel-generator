@@ -20,7 +20,7 @@ except Exception:
     vfx = None
 
 # ======================================================
-# FIX: session_state must be initialized BEFORE widgets
+# Session state init (must be before widgets)
 # ======================================================
 if "topics_text" not in st.session_state:
     st.session_state["topics_text"] = ""
@@ -103,6 +103,88 @@ def remember_topics(topics):
     save_topic_history(TOPIC_HISTORY)
 
 # ===============================
+# AUTO TOPIC GENERATOR (no duplicates)
+# ===============================
+PILLARS = {
+    "Physics": [
+        "fire", "shadow", "heat", "sound", "electricity", "motion", "pressure", "gravity",
+        "friction", "waves", "reflection", "refraction", "light", "static electricity"
+    ],
+    "Chemistry": [
+        "water", "salt", "soap", "oil", "rust", "bubbles", "glass", "ice", "sugar",
+        "coffee", "vinegar", "baking soda", "oxygen", "carbon dioxide"
+    ],
+    "Biology": [
+        "sleep", "yawning", "heartbeat", "muscles", "brain", "eyes", "smell", "taste",
+        "skin", "sweat", "goosebumps", "hiccups"
+    ],
+    "Space": [
+        "moon", "stars", "black holes", "planets", "sun", "comets", "aurora",
+        "time dilation", "meteorites", "galaxies", "satellites"
+    ],
+    "Mind": [
+        "paradox", "illusion", "probability", "memory", "attention", "habit",
+        "decision", "confidence", "bias", "pattern", "luck"
+    ],
+}
+
+TEMPLATES = [
+    "Why does {x} happen?",
+    "Why doesn’t {x} do what we expect?",
+    "What happens if {x} changes?",
+    "Most people think {x}, but is it true?",
+]
+
+def make_candidates():
+    candidates = []
+    for words in PILLARS.values():
+        for w in words:
+            for tpl in TEMPLATES:
+                q = tpl.format(x=w).strip()
+                if len(q) <= 70:
+                    candidates.append(q)
+    return candidates
+
+ALL_CANDIDATES = make_candidates()
+
+def generate_new_topics(n=20):
+    used = set(t.lower() for t in TOPIC_HISTORY)
+    seed = int(datetime.utcnow().strftime("%Y%m%d"))
+    rng = random.Random(seed + random.randint(0, 10_000_000))
+    pool = ALL_CANDIDATES[:]
+    rng.shuffle(pool)
+
+    out = []
+    for q in pool:
+        k = q.lower().strip()
+        if k in used:
+            continue
+        out.append(q)
+        used.add(k)
+        if len(out) >= n:
+            break
+    return out
+
+# ===============================
+# CALLBACKS (IMPORTANT FIX)
+# ===============================
+def cb_autogenerate():
+    new_topics = generate_new_topics(20)
+    if not new_topics:
+        st.session_state["topics_text"] = ""
+        st.session_state["auto_error"] = "No new topics left in the pool. Clear history or expand pool."
+        return
+    remember_topics(new_topics)
+    st.session_state["topics_text"] = "\n".join(new_topics)
+    st.session_state["auto_error"] = ""
+
+def cb_clear_history():
+    save_topic_history([])
+    TOPIC_HISTORY.clear()
+    st.session_state["topics_text"] = ""
+    st.session_state["auto_error"] = ""
+
+# ===============================
 # UI
 # ===============================
 st.title("YouTube Reel Generator — Batch + Auto Topics (No duplicates)")
@@ -121,6 +203,9 @@ CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 crossfade_seconds = st.slider("Crossfade seconds", 0.2, 1.2, 0.7)
 pexels_delay = st.slider("Delay between Pexels calls (seconds)", 0.0, 1.5, 0.25)
 DEBUG = st.toggle("Show debug", False)
+
+if "auto_error" not in st.session_state:
+    st.session_state["auto_error"] = ""
 
 # ===============================
 # FONT LOADER (cloud-safe)
@@ -304,9 +389,6 @@ def build_crossfade_video_synced(image_paths, audio_duration, xfade):
         raise ValueError("No images to build video.")
 
     xfade = max(0.0, min(xfade, 2.0))
-
-    # D so final duration == audio_duration:
-    # final = n*D - (n-1)*xfade  =>  D = (audio + (n-1)*xfade)/n
     D = (audio_duration + (n - 1) * xfade) / n
     if D <= xfade * 1.1:
         xfade = D * 0.3
@@ -374,72 +456,6 @@ def build_one_reel(topic: str, index: int):
     return out
 
 # ===============================
-# AUTO TOPIC GENERATOR (no duplicates)
-# ===============================
-PILLARS = {
-    "Physics": [
-        "fire", "shadow", "heat", "sound", "electricity", "motion", "pressure", "gravity",
-        "friction", "waves", "reflection", "refraction", "light", "static electricity"
-    ],
-    "Chemistry": [
-        "water", "salt", "soap", "oil", "rust", "bubbles", "glass", "ice", "sugar",
-        "coffee", "vinegar", "baking soda", "oxygen", "carbon dioxide"
-    ],
-    "Biology": [
-        "sleep", "yawning", "heartbeat", "muscles", "brain", "eyes", "smell", "taste",
-        "skin", "sweat", "goosebumps", "hiccups"
-    ],
-    "Space": [
-        "moon", "stars", "black holes", "planets", "sun", "comets", "aurora",
-        "time dilation", "meteorites", "galaxies", "satellites"
-    ],
-    "Mind": [
-        "paradox", "illusion", "probability", "memory", "attention", "habit",
-        "decision", "confidence", "bias", "pattern", "luck"
-    ],
-}
-
-TEMPLATES = [
-    "Why does {x} happen?",
-    "Why doesn’t {x} do what we expect?",
-    "What happens if {x} changes?",
-    "Most people think {x}, but is it true?",
-]
-
-def make_candidates():
-    candidates = []
-    for words in PILLARS.values():
-        for w in words:
-            for tpl in TEMPLATES:
-                q = tpl.format(x=w).strip()
-                if len(q) <= 70:
-                    candidates.append(q)
-    return candidates
-
-ALL_CANDIDATES = make_candidates()
-
-def generate_new_topics(n=20):
-    used = set(t.lower() for t in TOPIC_HISTORY)
-
-    seed = int(datetime.utcnow().strftime("%Y%m%d"))
-    rng = random.Random(seed + random.randint(0, 10_000_000))
-
-    pool = ALL_CANDIDATES[:]
-    rng.shuffle(pool)
-
-    out = []
-    for q in pool:
-        k = q.lower().strip()
-        if k in used:
-            continue
-        out.append(q)
-        used.add(k)
-        if len(out) >= n:
-            break
-
-    return out
-
-# ===============================
 # UI: Single or Batch
 # ===============================
 if mode == "Single Reel":
@@ -462,25 +478,13 @@ else:
             height=320,
             placeholder="Click Auto-generate 20 new topics…"
         )
+        if st.session_state.get("auto_error"):
+            st.error(st.session_state["auto_error"])
 
     with col2:
         st.subheader("Auto topics")
-
-        if st.button("Auto-generate 20 NEW topics"):
-            new_topics = generate_new_topics(20)
-            if not new_topics:
-                st.error("No new topics left in the pool. Clear history or expand pool.")
-            else:
-                remember_topics(new_topics)
-                st.session_state["topics_text"] = "\n".join(new_topics)
-                st.experimental_rerun()  # IMPORTANT
-
-        if st.button("Clear topic history (start over)"):
-            save_topic_history([])
-            TOPIC_HISTORY[:] = load_topic_history()
-            st.session_state["topics_text"] = ""
-            st.experimental_rerun()
-
+        st.button("Auto-generate 20 NEW topics", on_click=cb_autogenerate)
+        st.button("Clear topic history (start over)", on_click=cb_clear_history)
         st.caption(f"Remembered topics: {len(TOPIC_HISTORY)}")
 
     if st.button("Generate Batch (up to 20 Reels)"):
