@@ -12,11 +12,9 @@ from gtts import gTTS
 # MoviePy import (Cloud + Local compatible)
 # -------------------------------------------------
 try:
-    # MoviePy v2 (local / newer)
     from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
     MOVIEPY_V2 = True
 except ImportError:
-    # MoviePy v1 (Streamlit Cloud)
     from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
     MOVIEPY_V2 = False
 
@@ -48,10 +46,9 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-# Text model for script JSON
 TEXT_MODEL = "gemini-2.5-flash"
 
-# Image models to try (in order). Your earlier model list included these names.
+# Try multiple image models (your earlier model list included these)
 IMAGE_MODELS_TO_TRY = [
     "gemini-2.5-flash-image",
     "gemini-2.5-flash-image-preview",
@@ -64,7 +61,9 @@ IMAGE_MODELS_TO_TRY = [
 topic = st.text_input("Enter a topic for the YouTube Reel", value="Why does fire have no shadow?")
 num_scenes = st.slider("Number of scenes", 5, 10, 7)
 
-use_ai_images = st.toggle("Use AI-generated images (auto-fallback if blocked)", value=True)
+use_ai_images = st.toggle("Use AI-generated images", value=True)
+show_image_debug = st.toggle("Show AI image debug (recommended)", value=True)
+
 image_style = st.selectbox(
     "Image style",
     ["cinematic", "photorealistic", "minimal infographic", "3D render", "anime"],
@@ -126,10 +125,9 @@ def _extract_first_image_bytes(resp) -> bytes | None:
             return base64.b64decode(data)
     return None
 
-def generate_ai_image(scene_text: str, idx: int) -> Path | None:
+def try_generate_ai_image(scene_text: str, idx: int):
     """
-    Tries multiple Gemini image models. If any call fails (ClientError/permissions),
-    return None so we fall back to placeholder.
+    Returns (img_path_or_none, debug_lines)
     """
     prompt = (
         f"Create a single vertical 9:16 image for a YouTube Shorts reel.\n"
@@ -138,10 +136,10 @@ def generate_ai_image(scene_text: str, idx: int) -> Path | None:
         f"Do not add any text overlays or subtitles."
     )
 
-    last_err = None
-
+    debug = []
     for model_name in IMAGE_MODELS_TO_TRY:
         try:
+            debug.append(f"Trying model: {model_name}")
             resp = client.models.generate_content(
                 model=model_name,
                 contents=[prompt],
@@ -153,21 +151,30 @@ def generate_ai_image(scene_text: str, idx: int) -> Path | None:
             if img_bytes:
                 out = IMG_DIR / f"scene_{idx}.png"
                 out.write_bytes(img_bytes)
-                return out
+                debug.append(f"✅ Image bytes received ({len(img_bytes)} bytes)")
+                return out, debug
+            else:
+                debug.append("❌ No image bytes returned (response had no inline image data)")
         except Exception as e:
-            # Covers google.genai.errors.ClientError and other transient issues
-            last_err = e
-            continue
+            debug.append(f"❌ Error: {type(e).__name__}: {e}")
 
-    # Show one warning per run (not per scene) if image gen is blocked
-    if last_err is not None and "ai_image_warned" not in st.session_state:
-        st.session_state["ai_image_warned"] = True
-        st.warning(
-            "AI image generation failed (likely model access/permissions/quota on Cloud). "
-            "Falling back to placeholder images so the MP4 can still be created."
-        )
+    return None, debug
 
-    return None
+# -----------------------
+# QUICK TEST BUTTON
+# -----------------------
+st.divider()
+if st.button("Test AI image generation"):
+    test_scene = "A cinematic close-up of a candle flame in a dark room, soft glow, realistic lighting."
+    img, debug = try_generate_ai_image(test_scene, 999)
+    st.subheader("AI Image Test Result")
+    if img:
+        st.success("AI image generation worked.")
+        st.image(str(img), use_container_width=True)
+    else:
+        st.error("AI image generation FAILED. See debug below (this is the reason you only get placeholders).")
+    st.code("\n".join(debug))
+st.divider()
 
 # -----------------------
 # Generate everything
@@ -188,13 +195,11 @@ Format EXACTLY:
 }}
 """.strip()
 
-    # ---- Text generation (FORCE JSON)
+    # Force JSON
     result = client.models.generate_content(
         model=TEXT_MODEL,
         contents=script_prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json"
-        ),
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
 
     raw = (getattr(result, "text", "") or "").strip()
@@ -211,7 +216,6 @@ Format EXACTLY:
         st.code(raw)
         st.stop()
 
-    # ---- Display + make assets
     st.subheader("Hook")
     st.success(data.get("hook", ""))
 
@@ -233,8 +237,10 @@ Format EXACTLY:
         narration_parts.append(scene_text)
 
         img_path = None
+        debug_lines = []
+
         if use_ai_images:
-            img_path = generate_ai_image(scene_text, i)
+            img_path, debug_lines = try_generate_ai_image(scene_text, i)
 
         if not img_path:
             img_path = make_placeholder_image(scene_text, i)
@@ -244,6 +250,10 @@ Format EXACTLY:
         st.write(f"**Scene {i}:** {scene_text}")
         st.image(str(img_path), use_container_width=True)
 
+        if show_image_debug and use_ai_images:
+            with st.expander(f"AI image debug (Scene {i})"):
+                st.code("\n".join(debug_lines) if debug_lines else "No debug output.")
+
         progress.progress(i / len(scenes))
 
     st.subheader("CTA")
@@ -252,13 +262,11 @@ Format EXACTLY:
 
     narration = ". ".join([p.strip() for p in narration_parts if p and p.strip()]) + "."
 
-    # ---- Voiceover
     audio_path = AUD_DIR / "voiceover.mp3"
     gTTS(narration, lang="en", slow=False).save(str(audio_path))
     st.subheader("Voiceover Preview")
     st.audio(str(audio_path))
 
-    # ---- Video render
     audio = AudioFileClip(str(audio_path))
     per_image = max(0.8, audio.duration / len(images))
 
