@@ -6,6 +6,7 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
+from moviepy.audio.fx.all import speedx
 
 # ===============================
 # CONFIG
@@ -21,7 +22,7 @@ for d in (IMG_DIR, AUD_DIR, VID_DIR):
 PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
 
 # ===============================
-# UI (fixed structure you asked)
+# UI (your requested structure)
 # ===============================
 st.title("YouTube Reel Generator – 6 Scenes × 10s (2 images per scene)")
 
@@ -29,7 +30,9 @@ topic = st.text_input("Topic", "Why does fire have no shadow?")
 
 SCENES = 6
 SCENE_SECONDS = 10.0
+TARGET_SECONDS = SCENES * SCENE_SECONDS  # 60
 IMAGES_PER_SCENE = 2
+
 TRANSITION_SEC = st.slider("Transition (crossfade) seconds", 0.2, 1.0, 0.5)
 ENABLE_ZOOM = st.toggle("Enable subtle zoom (Ken Burns)", True)
 ZOOM_STRENGTH = st.slider("Zoom strength", 1.01, 1.08, 1.04)
@@ -41,17 +44,16 @@ CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 show_debug = st.toggle("Show debug", False)
 
 # ===============================
-# SCRIPT (no AI; stable)
+# SCRIPT (6 scenes)
 # ===============================
 def build_6_scene_script(topic: str):
-    # 6 lines total = 6 scenes
     return [
         f"{topic} — quick answer.",
         "A shadow forms when one strong light is blocked.",
         "Fire is glowing hot gas that emits its own light.",
         "Because it emits light, it fills in its own shadow.",
         "Flames are partly transparent, so they don’t block all light.",
-        "You only see a shadow if a much brighter light is behind the flame."
+        "You only see a shadow if a much brighter light is behind the flame.",
     ]
 
 script = build_6_scene_script(topic)
@@ -106,12 +108,8 @@ def burn_caption(img: Image.Image, caption: str) -> Image.Image:
 def fetch_pexels_images(query: str, count: int):
     headers = {"Authorization": PEXELS_API_KEY}
     url = "https://api.pexels.com/v1/search"
-    params = {
-        "query": query,
-        "per_page": 20,
-        "orientation": "portrait",
-        "size": "large",
-    }
+    params = {"query": query, "per_page": 20, "orientation": "portrait", "size": "large"}
+
     r = requests.get(url, headers=headers, params=params, timeout=20)
     r.raise_for_status()
     photos = r.json().get("photos", [])
@@ -137,12 +135,10 @@ def fetch_pexels_images(query: str, count: int):
         img.save(img_path, quality=95)
         paths.append(img_path)
 
-    # If Pexels returned < count, duplicate last so timing is stable
     if not paths:
         return []
     while len(paths) < count:
         paths.append(paths[-1])
-
     return paths[:count]
 
 # ===============================
@@ -154,20 +150,25 @@ def apply_zoom(clip, zoom):
     return clip.resize(lambda t: 1 + (zoom - 1) * (t / clip.duration))
 
 # ===============================
-# BUILD VIDEO (60 seconds exactly in visuals)
+# BUILD VIDEO (visuals fixed 60s, audio forced to 60s)
 # ===============================
 if st.button("Generate Final MP4 Reel"):
     st.info("Generating reel… (6 scenes × 10s, 2 images each)")
 
-    # ---- Voiceover (will be whatever length TTS produces)
+    # ---- Create narration audio
     narration = " ".join(script)
     audio_path = AUD_DIR / "voice.mp3"
     gTTS(narration).save(audio_path)
     audio = AudioFileClip(str(audio_path))
 
-    # ---- Build visual timeline: 6 scenes × 10 seconds = 60 sec
-    # Each scene has 2 images → 5 seconds each
-    per_image_duration = SCENE_SECONDS / IMAGES_PER_SCENE  # 10/2 = 5s
+    # ---- Force audio to exactly 60 seconds using speedx (free)
+    # factor < 1 => slower (longer). factor > 1 => faster (shorter).
+    if audio.duration > 0:
+        factor = audio.duration / TARGET_SECONDS  # old/target
+        audio = speedx(audio, factor=factor).subclip(0, TARGET_SECONDS)
+
+    # ---- Build 60s visuals: 12 images × 5s each
+    per_image_duration = SCENE_SECONDS / IMAGES_PER_SCENE  # 5s
 
     clips = []
     all_images = []
@@ -186,25 +187,18 @@ if st.button("Generate Final MP4 Reel"):
             clips.append(c)
 
     final_video = concatenate_videoclips(
-        clips,
-        method="compose",
-        padding=-TRANSITION_SEC
-    )
-
-    # ---- AUDIO HANDLING
-    # Option A (default): keep your narration audio; video duration stays 60s visuals.
-    # If audio is longer than 60s, it will be cut.
-    # If audio is shorter, you’ll have silence at the end.
-    final_video = final_video.set_audio(audio.subclip(0, min(audio.duration, final_video.duration)))
+        clips, method="compose", padding=-TRANSITION_SEC
+    ).set_audio(audio)
 
     out = VID_DIR / "final_reel.mp4"
     final_video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
 
     if show_debug:
-        st.write("Audio duration:", round(audio.duration, 2))
-        st.write("Video duration:", round(final_video.duration, 2))
+        st.write("Original TTS audio duration:", round(AudioFileClip(str(audio_path)).duration, 2))
+        st.write("Final audio duration:", round(audio.duration, 2))
+        st.write("Final video duration:", round(final_video.duration, 2))
         st.write("Images used:", len(all_images))
 
-    st.success("Final MP4 ready (visual timeline = 60 seconds).")
+    st.success("Final MP4 ready (audio and visuals both = 60 seconds).")
     st.video(str(out))
     st.download_button("Download MP4", open(out, "rb"), "reel.mp4")
