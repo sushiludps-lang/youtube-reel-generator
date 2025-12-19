@@ -8,6 +8,11 @@ import streamlit as st
 from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+# --- FIX for MoviePy on new Pillow (Image.ANTIALIAS removed) ---
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
 from gtts import gTTS
 
 # -------------------------------------------------
@@ -110,13 +115,9 @@ def pexels_search_urls(query: str, k: int):
         return [], None, "PEXELS_API_KEY missing"
 
     headers = {"Authorization": PEXELS_KEY}
-    params = {
-        "query": query,
-        "per_page": 80,
-        "orientation": "portrait",
-        "size": "large",
-    }
+    params = {"query": query, "per_page": 80, "orientation": "portrait", "size": "large"}
     r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=25)
+
     if r.status_code != 200:
         return [], r.status_code, r.text[:500]
 
@@ -136,7 +137,6 @@ def pexels_search_urls(query: str, k: int):
     if not urls:
         return [], 200, "No usable src URLs"
 
-    # de-dup
     urls = list(dict.fromkeys(urls))
     random.shuffle(urls)
     return urls[:k], 200, "OK"
@@ -145,15 +145,13 @@ def download_and_fit_9x16(img_url: str, out_path: Path):
     r = requests.get(img_url, timeout=30)
     r.raise_for_status()
     img = Image.open(BytesIO(r.content)).convert("RGB")
+    img = ImageOps.exif_transpose(img)
 
     target_w, target_h = 1080, 1920
-    img = ImageOps.exif_transpose(img)  # fix orientation if needed
-
     w, h = img.size
     target_ratio = target_w / target_h
     src_ratio = w / h
 
-    # Center crop to 9:16
     if src_ratio > target_ratio:
         new_w = int(h * target_ratio)
         left = (w - new_w) // 2
@@ -191,7 +189,6 @@ def build_images_for_scene(scene_text: str, clip_start_idx: int, k: int):
     return paths
 
 def ken_burns(clip: ImageClip, zoom=1.04):
-    # Gentle zoom-in over duration (Cloud-safe: avoids deprecated PIL constants)
     return clip.fx(vfx.resize, lambda t: 1 + (zoom - 1) * (t / clip.duration))
 
 # -----------------------
@@ -199,7 +196,6 @@ def ken_burns(clip: ImageClip, zoom=1.04):
 # -----------------------
 if st.button("Generate Final MP4 Reel", type="primary"):
 
-    # Force shorter scripts (aim ~60s)
     script_prompt = f"""
 Return ONLY valid JSON. No commentary. No markdown. No extra text.
 
@@ -242,25 +238,15 @@ Format EXACTLY:
     hook = data.get("hook", "")
     cta = data.get("cta", "")
 
-    st.subheader("Script")
-    st.write("**Hook:**", hook)
-    for i, s in enumerate(scenes, 1):
-        st.write(f"**Scene {i}:**", s)
-    st.write("**CTA:**", cta)
-
-    # Build narration
     narration_parts = [hook] + [str(s) for s in scenes] + [cta]
     narration = ". ".join([p.strip() for p in narration_parts if p and p.strip()]) + "."
 
-    # Voiceover
     audio_path = AUD_DIR / "voiceover.mp3"
     gTTS(narration, lang="en", slow=False).save(str(audio_path))
-    st.subheader("Voiceover Preview")
     st.audio(str(audio_path))
 
     audio = AudioFileClip(str(audio_path))
 
-    # Build many image clips (more images = smoother)
     all_image_paths = []
     clip_idx = 1
     for s in scenes:
@@ -268,10 +254,8 @@ Format EXACTLY:
         all_image_paths.extend(paths)
         clip_idx += imgs_per_scene
 
-    # Duration per image based on audio length
     per_img = max(0.5, audio.duration / max(1, len(all_image_paths)))
 
-    # Create clips with transitions
     clips = []
     for idx, p in enumerate(all_image_paths):
         if MOVIEPY_V2:
@@ -282,7 +266,6 @@ Format EXACTLY:
         if enable_kenburns and kenburns_zoom > 1.0:
             c = ken_burns(c, zoom=kenburns_zoom)
 
-        # Crossfade-in except first clip
         if transition_sec > 0 and idx > 0:
             if MOVIEPY_V2:
                 c = c.with_effects([vfx.CrossFadeIn(transition_sec)])
@@ -301,9 +284,4 @@ Format EXACTLY:
 
     st.success(f"Final MP4 ready • Images: {len(all_image_paths)} • Audio: {audio.duration:.1f}s • Per image: {per_img:.2f}s")
     st.video(str(out_video))
-    st.download_button(
-        "Download MP4",
-        data=open(out_video, "rb"),
-        file_name="final_reel.mp4",
-        mime="video/mp4",
-    )
+    st.download_button("Download MP4", data=open(out_video, "rb"), file_name="final_reel.mp4", mime="video/mp4")
