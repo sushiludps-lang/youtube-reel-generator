@@ -6,7 +6,6 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# MoviePy v2 imports
 from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
 
 # ===============================
@@ -21,21 +20,21 @@ for d in (IMG_DIR, AUD_DIR, VID_DIR):
     d.mkdir(exist_ok=True)
 
 PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
-
-# Always 2 images per scene (your requirement)
-IMAGES_PER_SCENE = 2
+IMAGES_PER_SCENE = 2  # fixed
 
 # ===============================
 # UI
 # ===============================
-st.title("YouTube Reel Generator — Duration Driven by Narration (2 images/scene)")
+st.title("YouTube Reel Generator — Min Duration + Auto Scenes (2 images/scene)")
 
 topic = st.text_input("Topic", "Why does fire have no shadow?")
 
-target_scene_seconds = st.slider(
-    "Target seconds per scene (auto adjusts #scenes)",
-    4, 12, 7
-)
+target_scene_seconds = st.slider("Target seconds per scene", 4, 12, 7)
+
+# NEW: force longer output
+min_video_seconds = st.slider("Minimum video length (seconds)", 10, 60, 30)
+min_scenes = st.slider("Minimum scenes", 2, 12, 6)
+max_scenes = st.slider("Maximum scenes", 3, 20, 10)
 
 ENABLE_CAPTIONS = st.toggle("Burn captions on images", True)
 CAPTION_FONT_SIZE = st.slider("Caption font size", 42, 84, 64)
@@ -88,7 +87,7 @@ def burn_caption(img, caption):
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 # ===============================
-# PEXELS FETCH (exactly 2 images per scene)
+# PEXELS FETCH (2 images/scene)
 # ===============================
 def fetch_images(scene_text):
     headers = {"Authorization": PEXELS_API_KEY}
@@ -118,87 +117,95 @@ def fetch_images(scene_text):
 
     if not paths:
         return []
-
     while len(paths) < IMAGES_PER_SCENE:
         paths.append(paths[-1])
-
     return paths[:IMAGES_PER_SCENE]
 
 # ===============================
-# SCRIPT POOL (free, no LLM)
+# LONGER SCRIPT POOL (so TTS is not 8 seconds)
 # ===============================
 def script_pool(topic: str):
-    # A pool of short scene lines; we will take as many as needed.
     return [
         f"{topic} — quick answer.",
         "A shadow needs a strong background light and something that blocks it.",
-        "Flames are not solid; they’re hot gases plus glowing particles.",
-        "Fire emits light in many directions, so it fills in the dark area.",
-        "Flames are also partly transparent, so they don’t block all light.",
-        "That’s why a candle usually doesn’t cast a crisp shadow indoors.",
-        "But if you put a brighter light behind the flame, you can see a shadow.",
-        "Try it: flashlight behind a lighter, then look at the wall.",
-        "The flame’s brightness and transparency decide how visible the shadow is.",
-        "So the ‘no shadow’ idea is really: no clear shadow in normal lighting."
+        "Fire isn’t a solid object; it’s hot gas plus glowing soot particles.",
+        "Because fire emits light, it can ‘fill in’ the dark area you expect.",
+        "Flames are also partly transparent, so they don’t block all light strongly.",
+        "That’s why a candle often won’t cast a sharp shadow on a wall.",
+        "But a brighter light behind the flame can force a visible shadow.",
+        "Try it: flashlight behind a lighter, then look at the wall edge.",
+        "If the flame is dim and the background light is strong, shadow becomes clearer.",
+        "If the flame is bright, it washes out the shadow contrast.",
+        "Also, moving flames blur edges, which makes shadows look weak.",
+        "So it’s not ‘zero shadow’—it’s usually ‘no crisp shadow’ in normal lighting.",
+        "In a lab demo, you can tune light intensity to make it appear or disappear.",
+        "That’s the physics: emission + transparency + contrast.",
+        "Follow for more quick science reels.",
     ]
 
 # ===============================
-# AUTO-ADJUST SCENES BASED ON TTS DURATION (no repetition)
+# BUILD SCRIPT UNTIL IT'S LONG ENOUGH
 # ===============================
-def build_script_to_match_duration(topic: str, target_scene_sec: float):
-    pool = script_pool(topic)
-
-    # Start with a reasonable guess
-    script = pool[:6]
-
-    # Iterate to stabilize: script length -> TTS duration -> needed scenes -> adjust script length
-    for _ in range(3):
-        narration = " ".join(script)
-        tmp_mp3 = AUD_DIR / "tmp_voice.mp3"
-        gTTS(narration).save(str(tmp_mp3))
-        audio = AudioFileClip(str(tmp_mp3))
-        dur = max(1.0, audio.duration)
-
-        scenes_needed = max(1, int(round(dur / target_scene_sec)))
-        scenes_needed = min(scenes_needed, len(pool))  # don’t exceed pool size
-
-        new_script = pool[:scenes_needed]
-
-        if len(new_script) == len(script):
-            return new_script, tmp_mp3, dur
-
-        script = new_script
-
-    # final
-    narration = " ".join(script)
+def tts_duration_for(script_lines):
+    narration = " ".join(script_lines)
     tmp_mp3 = AUD_DIR / "tmp_voice.mp3"
     gTTS(narration).save(str(tmp_mp3))
-    audio = AudioFileClip(str(tmp_mp3))
-    dur = max(1.0, audio.duration)
-    return script, tmp_mp3, dur
+    a = AudioFileClip(str(tmp_mp3))
+    return tmp_mp3, a.duration
+
+def build_script(topic, target_scene_sec, min_secs, min_s, max_s):
+    pool = script_pool(topic)
+
+    # start with minimum scenes
+    n = max(min_s, 2)
+    n = min(n, max_s, len(pool))
+    script = pool[:n]
+
+    # extend until duration >= min_secs (or hit max scenes)
+    for _ in range(25):
+        mp3, dur = tts_duration_for(script)
+
+        # also keep scenes roughly near target_scene_seconds (optional)
+        scenes_needed = int(round(dur / target_scene_sec))
+        scenes_needed = max(min_s, min(max_s, scenes_needed, len(pool)))
+
+        # ensure we meet minimum seconds by adding more lines if needed
+        if dur < min_secs and len(script) < max_s and len(script) < len(pool):
+            script = pool[:len(script) + 1]
+            continue
+
+        # adjust to scenes_needed if it increases scene count (avoid collapsing too much)
+        if scenes_needed > len(script):
+            script = pool[:scenes_needed]
+            continue
+
+        return script, mp3, dur
+
+    mp3, dur = tts_duration_for(script)
+    return script, mp3, dur
 
 # ===============================
-# BUILD VIDEO (duration == audio duration)
+# BUILD VIDEO
 # ===============================
 if st.button("Generate Final MP4 Reel"):
-    script, voice_path, audio_duration = build_script_to_match_duration(topic, target_scene_seconds)
+    script, voice_path, audio_duration = build_script(
+        topic, target_scene_seconds, min_video_seconds, min_scenes, max_scenes
+    )
 
     scenes = len(script)
     scene_duration = audio_duration / scenes
-    per_image_duration = scene_duration / IMAGES_PER_SCENE  # always 2 images
+    per_image_duration = scene_duration / IMAGES_PER_SCENE
 
     if DEBUG:
         st.write("Audio duration (s):", round(audio_duration, 2))
         st.write("Scenes:", scenes)
         st.write("Scene duration (s):", round(scene_duration, 2))
-        st.write("Per-image duration (s):", round(per_image_duration, 2))
+        st.write("Per image duration (s):", round(per_image_duration, 2))
 
-    # Load final audio (use the same mp3 we generated)
     audio = AudioFileClip(str(voice_path))
 
     clips = []
     used = 0
-
     for scene_text in script:
         imgs = fetch_images(scene_text)
         if not imgs:
@@ -211,16 +218,11 @@ if st.button("Generate Final MP4 Reel"):
 
     video = concatenate_videoclips(clips, method="compose", padding=0)
 
-    # Attach audio; trim audio to video length (or vice versa) safely
-    # (They should match closely; this avoids tiny drift.)
-    final_dur = video.duration
-    if hasattr(audio, "subclip") and audio.duration > final_dur:
-        audio = audio.subclip(0, final_dur)
+    # Trim audio to video duration if slightly longer (prevents drift)
+    if hasattr(audio, "subclip") and audio.duration > video.duration:
+        audio = audio.subclip(0, video.duration)
 
-    if hasattr(video, "with_audio"):
-        video = video.with_audio(audio)
-    else:
-        video = video.set_audio(audio)
+    video = video.with_audio(audio) if hasattr(video, "with_audio") else video.set_audio(audio)
 
     out = VID_DIR / "final_reel.mp4"
     video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
