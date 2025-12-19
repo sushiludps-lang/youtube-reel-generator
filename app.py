@@ -1,8 +1,10 @@
 import json
+import base64
 from pathlib import Path
 
 import streamlit as st
 from google import genai
+from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
 from gtts import gTTS
 
@@ -45,32 +47,42 @@ if not api_key:
     st.stop()
 
 client = genai.Client(api_key=api_key)
-MODEL_NAME = "gemini-2.5-flash"
+
+# Text model for script JSON
+TEXT_MODEL = "gemini-2.5-flash"
+# Image model for scene images
+IMAGE_MODEL = "gemini-2.5-flash-image"  # image generation model :contentReference[oaicite:1]{index=1}
 
 # -----------------------
 # User input
 # -----------------------
-topic = st.text_input(
-    "Enter a topic for the YouTube Reel",
-    value="Why does fire have no shadow?"
-)
+topic = st.text_input("Enter a topic for the YouTube Reel", value="Why does fire have no shadow?")
 num_scenes = st.slider("Number of scenes", 5, 10, 7)
 
+use_ai_images = st.toggle("Use AI-generated images (recommended)", value=True)
+image_style = st.selectbox(
+    "Image style",
+    ["cinematic", "photorealistic", "minimal infographic", "3D render", "anime"],
+    index=0
+)
+
 # -----------------------
-# Placeholder image
+# Helpers
 # -----------------------
+def _load_font(size: int = 64):
+    try:
+        return ImageFont.truetype("arial.ttf", size)
+    except Exception:
+        return ImageFont.load_default()
+
 def make_placeholder_image(text: str, idx: int) -> Path:
     img = Image.new("RGB", (1080, 1920), (15, 15, 20))
     draw = ImageDraw.Draw(img)
-
-    try:
-        font = ImageFont.truetype("arial.ttf", 64)
-    except Exception:
-        font = ImageFont.load_default()
+    font = _load_font(64)
 
     draw.text((80, 120), f"Scene {idx}", fill=(200, 200, 200), font=font)
 
-    # simple wrap
+    # Simple wrap
     words = text.split()
     lines, line = [], ""
     for w in words:
@@ -91,12 +103,61 @@ def make_placeholder_image(text: str, idx: int) -> Path:
     img.save(out)
     return out
 
+def generate_ai_image(scene_text: str, idx: int) -> Path | None:
+    """
+    Calls Gemini image model and saves the first returned image to images/scene_{idx}.png
+    Returns Path if successful, else None.
+    """
+    prompt = (
+        f"Create a single vertical 9:16 image for a short YouTube reel.\n"
+        f"Style: {image_style}.\n"
+        f"Scene: {scene_text}\n"
+        f"Do not add any text overlays or subtitles."
+    )
+
+    # Request 9:16 aspect ratio for vertical reels :contentReference[oaicite:2]{index=2}
+    resp = client.models.generate_content(
+        model=IMAGE_MODEL,
+        contents=[prompt],
+        config=types.GenerateContentConfig(
+            image_config=types.ImageConfig(
+                aspect_ratio="9:16"
+            )
+        ),
+    )
+
+    # Extract inline image data
+    try:
+        parts = resp.candidates[0].content.parts
+    except Exception:
+        return None
+
+    image_bytes = None
+    for part in parts:
+        inline = getattr(part, "inline_data", None) or getattr(part, "inlineData", None)
+        if inline:
+            data = getattr(inline, "data", None)
+            if data:
+                # data may be bytes or base64 string depending on SDK version
+                if isinstance(data, (bytes, bytearray)):
+                    image_bytes = bytes(data)
+                elif isinstance(data, str):
+                    image_bytes = base64.b64decode(data)
+                break
+
+    if not image_bytes:
+        return None
+
+    out = IMG_DIR / f"scene_{idx}.png"
+    out.write_bytes(image_bytes)
+    return out
+
 # -----------------------
 # Generate everything
 # -----------------------
 if st.button("Generate Final MP4 Reel", type="primary"):
 
-    prompt = f"""
+    script_prompt = f"""
 Return ONLY valid JSON. No commentary. No markdown. No extra text.
 
 Topic: {topic}
@@ -110,11 +171,8 @@ Format EXACTLY:
 }}
 """.strip()
 
-    # ---- Gemini call (google-genai)
-    result = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-    )
+    # ---- Text generation (JSON)
+    result = client.models.generate_content(model=TEXT_MODEL, contents=script_prompt)
     raw = (getattr(result, "text", "") or "").strip()
 
     if not raw:
@@ -123,7 +181,6 @@ Format EXACTLY:
 
     raw = raw.replace("```json", "").replace("```", "").strip()
 
-    # ---- Robust JSON parse
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -135,7 +192,7 @@ Format EXACTLY:
             st.code(raw)
             st.stop()
 
-    # ---- Display + assets
+    # ---- Display + make assets
     st.subheader("Hook")
     st.success(data.get("hook", ""))
 
@@ -150,12 +207,24 @@ Format EXACTLY:
     narration_parts = [data.get("hook", "")]
 
     st.subheader("Scenes")
+    progress = st.progress(0)
     for i, scene in enumerate(scenes, start=1):
-        img_path = make_placeholder_image(str(scene), i)
-        images.append(img_path)
         narration_parts.append(str(scene))
+
+        # AI image first (if enabled), fallback to placeholder
+        img_path = None
+        if use_ai_images:
+            img_path = generate_ai_image(str(scene), i)
+
+        if not img_path:
+            img_path = make_placeholder_image(str(scene), i)
+
+        images.append(img_path)
+
         st.write(f"**Scene {i}:** {scene}")
         st.image(str(img_path), use_container_width=True)
+
+        progress.progress(i / len(scenes))
 
     st.subheader("CTA")
     st.info(cta)
@@ -163,32 +232,25 @@ Format EXACTLY:
 
     narration = ". ".join([p.strip() for p in narration_parts if p and str(p).strip()]) + "."
 
-    # ---- Voiceover (gTTS)
+    # ---- Voiceover
     audio_path = AUD_DIR / "voiceover.mp3"
     gTTS(narration, lang="en", slow=False).save(str(audio_path))
     st.subheader("Voiceover Preview")
     st.audio(str(audio_path))
 
-    # ---- Video render (MoviePy v1/v2 compatible)
+    # ---- Video render
     audio = AudioFileClip(str(audio_path))
     per_image = max(0.8, audio.duration / len(images))
 
     if MOVIEPY_V2:
-        # v2: duration in constructor + with_audio
         clips = [ImageClip(str(img), duration=per_image) for img in images]
         video = concatenate_videoclips(clips, method="compose").with_audio(audio)
     else:
-        # v1: set_duration + set_audio
         clips = [ImageClip(str(img)).set_duration(per_image) for img in images]
         video = concatenate_videoclips(clips, method="compose").set_audio(audio)
 
     out_video = VID_DIR / "final_reel.mp4"
-    video.write_videofile(
-        str(out_video),
-        fps=30,
-        codec="libx264",
-        audio_codec="aac",
-    )
+    video.write_videofile(str(out_video), fps=30, codec="libx264", audio_codec="aac")
 
     st.success("Final MP4 ready")
     st.video(str(out_video))
