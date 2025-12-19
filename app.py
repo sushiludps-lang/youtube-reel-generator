@@ -19,6 +19,12 @@ try:
 except Exception:
     vfx = None
 
+# ======================================================
+# FIX: session_state must be initialized BEFORE widgets
+# ======================================================
+if "topics_text" not in st.session_state:
+    st.session_state["topics_text"] = ""
+
 # ===============================
 # CONFIG / FOLDERS
 # ===============================
@@ -113,7 +119,6 @@ CAPTION_FONT_SIZE = st.slider("Caption font size", 42, 84, 64)
 CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 
 crossfade_seconds = st.slider("Crossfade seconds", 0.2, 1.2, 0.7)
-
 pexels_delay = st.slider("Delay between Pexels calls (seconds)", 0.0, 1.5, 0.25)
 DEBUG = st.toggle("Show debug", False)
 
@@ -378,19 +383,19 @@ PILLARS = {
     ],
     "Chemistry": [
         "water", "salt", "soap", "oil", "rust", "bubbles", "glass", "ice", "sugar",
-        "coffee", "vinegar", "baking soda", "alcohol", "oxygen"
+        "coffee", "vinegar", "baking soda", "oxygen", "carbon dioxide"
     ],
     "Biology": [
         "sleep", "yawning", "heartbeat", "muscles", "brain", "eyes", "smell", "taste",
-        "skin", "sweat", "goosebumps", "hiccups", "dandruff", "hair"
+        "skin", "sweat", "goosebumps", "hiccups"
     ],
     "Space": [
         "moon", "stars", "black holes", "planets", "sun", "comets", "aurora",
-        "time dilation", "meteorites", "galaxies", "satellites", "gravity in space"
+        "time dilation", "meteorites", "galaxies", "satellites"
     ],
     "Mind": [
         "paradox", "illusion", "probability", "memory", "attention", "habit",
-        "placebo", "decision", "confidence", "bias", "pattern", "luck"
+        "decision", "confidence", "bias", "pattern", "luck"
     ],
 }
 
@@ -403,7 +408,7 @@ TEMPLATES = [
 
 def make_candidates():
     candidates = []
-    for pillar, words in PILLARS.items():
+    for words in PILLARS.values():
         for w in words:
             for tpl in TEMPLATES:
                 q = tpl.format(x=w).strip()
@@ -416,7 +421,6 @@ ALL_CANDIDATES = make_candidates()
 def generate_new_topics(n=20):
     used = set(t.lower() for t in TOPIC_HISTORY)
 
-    # daily shuffle so each day changes
     seed = int(datetime.utcnow().strftime("%Y%m%d"))
     rng = random.Random(seed + random.randint(0, 10_000_000))
 
@@ -434,10 +438,6 @@ def generate_new_topics(n=20):
             break
 
     return out
-
-# Ensure the text area is always controlled by session_state
-if "topics_text" not in st.session_state:
-    st.session_state["topics_text"] = ""
 
 # ===============================
 # UI: Single or Batch
@@ -469,15 +469,17 @@ else:
         if st.button("Auto-generate 20 NEW topics"):
             new_topics = generate_new_topics(20)
             if not new_topics:
-                st.error("No new topics left in the pool (increase pool or clear history).")
+                st.error("No new topics left in the pool. Clear history or expand pool.")
             else:
-                remember_topics(new_topics)  # prevent repeats next time
+                remember_topics(new_topics)
                 st.session_state["topics_text"] = "\n".join(new_topics)
+                st.experimental_rerun()  # IMPORTANT
 
         if st.button("Clear topic history (start over)"):
             save_topic_history([])
-            TOPIC_HISTORY = load_topic_history()
+            TOPIC_HISTORY[:] = load_topic_history()
             st.session_state["topics_text"] = ""
+            st.experimental_rerun()
 
         st.caption(f"Remembered topics: {len(TOPIC_HISTORY)}")
 
