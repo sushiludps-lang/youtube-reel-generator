@@ -6,12 +6,11 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from moviepy import ImageClip, AudioFileClip, concatenate_videoclips, CompositeAudioClip
-from moviepy.audio.AudioClip import AudioArrayClip
-import numpy as np
+# MoviePy v2 imports
+from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
 
 # ===============================
-# CONFIG
+# CONFIG / FOLDERS
 # ===============================
 WIDTH, HEIGHT = 1080, 1920
 BASE = Path(__file__).parent
@@ -23,38 +22,26 @@ for d in (IMG_DIR, AUD_DIR, VID_DIR):
 
 PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
 
-SCENES = 6
-SCENE_SECONDS = 10.0
-TARGET_SECONDS = 60.0
-IMAGES_PER_SCENE = 2  # fixed
+# Always 2 images per scene (your requirement)
+IMAGES_PER_SCENE = 2
 
 # ===============================
 # UI
 # ===============================
-st.title("YouTube Reel Generator — 60s (6 scenes × 10s, 2 images/scene)")
+st.title("YouTube Reel Generator — Duration Driven by Narration (2 images/scene)")
 
 topic = st.text_input("Topic", "Why does fire have no shadow?")
+
+target_scene_seconds = st.slider(
+    "Target seconds per scene (auto adjusts #scenes)",
+    4, 12, 7
+)
 
 ENABLE_CAPTIONS = st.toggle("Burn captions on images", True)
 CAPTION_FONT_SIZE = st.slider("Caption font size", 42, 84, 64)
 CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 
 DEBUG = st.toggle("Show debug", False)
-
-# ===============================
-# SCRIPT (6 scenes)
-# ===============================
-def build_script(topic):
-    return [
-        f"{topic} — quick answer.",
-        "A shadow forms when one strong light is blocked.",
-        "Fire is glowing hot gas that emits its own light.",
-        "Because it emits light, it fills in its own shadow.",
-        "Flames are partly transparent, so they don’t block all light.",
-        "You only see a shadow if a brighter light is behind the flame.",
-    ]
-
-script = build_script(topic)
 
 # ===============================
 # FONT LOADER (cloud-safe)
@@ -74,7 +61,7 @@ def load_font(size):
 FONT = load_font(CAPTION_FONT_SIZE)
 
 # ===============================
-# CAPTION DRAW
+# CAPTION BURN (PIL)
 # ===============================
 def burn_caption(img, caption):
     img = img.convert("RGBA")
@@ -101,7 +88,7 @@ def burn_caption(img, caption):
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 # ===============================
-# PEXELS FETCH (2 images/scene)
+# PEXELS FETCH (exactly 2 images per scene)
 # ===============================
 def fetch_images(scene_text):
     headers = {"Authorization": PEXELS_API_KEY}
@@ -131,79 +118,113 @@ def fetch_images(scene_text):
 
     if not paths:
         return []
+
     while len(paths) < IMAGES_PER_SCENE:
         paths.append(paths[-1])
+
     return paths[:IMAGES_PER_SCENE]
 
 # ===============================
-# AUDIO: repeat narration to fill 60s
+# SCRIPT POOL (free, no LLM)
 # ===============================
-def make_audio_fill_60s(narration_mp3_path: Path, target_seconds: float):
-    base = AudioFileClip(str(narration_mp3_path))
-
-    # 60s silence bed
-    sr = 44100
-    bed = AudioArrayClip(np.zeros((int(sr * target_seconds), 2), dtype=np.float32), fps=sr)
-
-    # If base is longer than 60s, just trim
-    if base.duration >= target_seconds and hasattr(base, "subclip"):
-        base = base.subclip(0, target_seconds)
-        mixed = CompositeAudioClip([bed, base])
-        mixed = mixed.with_duration(target_seconds) if hasattr(mixed, "with_duration") else mixed.set_duration(target_seconds)
-        return mixed, base.duration
-
-    # Repeat by placing the same audio clip multiple times
-    parts = [bed]
-    t = 0.0
-    while t < target_seconds - 0.01:
-        placed = base.with_start(t) if hasattr(base, "with_start") else base.set_start(t)
-        parts.append(placed)
-        t += base.duration
-
-    mixed = CompositeAudioClip(parts)
-    mixed = mixed.with_duration(target_seconds) if hasattr(mixed, "with_duration") else mixed.set_duration(target_seconds)
-    return mixed, base.duration
+def script_pool(topic: str):
+    # A pool of short scene lines; we will take as many as needed.
+    return [
+        f"{topic} — quick answer.",
+        "A shadow needs a strong background light and something that blocks it.",
+        "Flames are not solid; they’re hot gases plus glowing particles.",
+        "Fire emits light in many directions, so it fills in the dark area.",
+        "Flames are also partly transparent, so they don’t block all light.",
+        "That’s why a candle usually doesn’t cast a crisp shadow indoors.",
+        "But if you put a brighter light behind the flame, you can see a shadow.",
+        "Try it: flashlight behind a lighter, then look at the wall.",
+        "The flame’s brightness and transparency decide how visible the shadow is.",
+        "So the ‘no shadow’ idea is really: no clear shadow in normal lighting."
+    ]
 
 # ===============================
-# BUILD VIDEO
+# AUTO-ADJUST SCENES BASED ON TTS DURATION (no repetition)
+# ===============================
+def build_script_to_match_duration(topic: str, target_scene_sec: float):
+    pool = script_pool(topic)
+
+    # Start with a reasonable guess
+    script = pool[:6]
+
+    # Iterate to stabilize: script length -> TTS duration -> needed scenes -> adjust script length
+    for _ in range(3):
+        narration = " ".join(script)
+        tmp_mp3 = AUD_DIR / "tmp_voice.mp3"
+        gTTS(narration).save(str(tmp_mp3))
+        audio = AudioFileClip(str(tmp_mp3))
+        dur = max(1.0, audio.duration)
+
+        scenes_needed = max(1, int(round(dur / target_scene_sec)))
+        scenes_needed = min(scenes_needed, len(pool))  # don’t exceed pool size
+
+        new_script = pool[:scenes_needed]
+
+        if len(new_script) == len(script):
+            return new_script, tmp_mp3, dur
+
+        script = new_script
+
+    # final
+    narration = " ".join(script)
+    tmp_mp3 = AUD_DIR / "tmp_voice.mp3"
+    gTTS(narration).save(str(tmp_mp3))
+    audio = AudioFileClip(str(tmp_mp3))
+    dur = max(1.0, audio.duration)
+    return script, tmp_mp3, dur
+
+# ===============================
+# BUILD VIDEO (duration == audio duration)
 # ===============================
 if st.button("Generate Final MP4 Reel"):
-    st.info("Generating 60s reel…")
+    script, voice_path, audio_duration = build_script_to_match_duration(topic, target_scene_seconds)
 
-    # 1) TTS narration
-    narration_text = " ".join(script)
-    voice_path = AUD_DIR / "voice.mp3"
-    gTTS(narration_text).save(str(voice_path))
+    scenes = len(script)
+    scene_duration = audio_duration / scenes
+    per_image_duration = scene_duration / IMAGES_PER_SCENE  # always 2 images
 
-    audio, base_audio_dur = make_audio_fill_60s(voice_path, TARGET_SECONDS)
+    if DEBUG:
+        st.write("Audio duration (s):", round(audio_duration, 2))
+        st.write("Scenes:", scenes)
+        st.write("Scene duration (s):", round(scene_duration, 2))
+        st.write("Per-image duration (s):", round(per_image_duration, 2))
 
-    # 2) Visuals: 12 images total, 5 seconds each
-    per_image_dur = SCENE_SECONDS / IMAGES_PER_SCENE  # 5s
+    # Load final audio (use the same mp3 we generated)
+    audio = AudioFileClip(str(voice_path))
+
     clips = []
-    img_count = 0
+    used = 0
 
-    for scene in script:
-        imgs = fetch_images(scene)
+    for scene_text in script:
+        imgs = fetch_images(scene_text)
         if not imgs:
-            st.error("No images fetched. Check PEXELS_API_KEY or try a different topic.")
+            st.error("No images fetched from Pexels. Try a different topic or verify PEXELS_API_KEY.")
             st.stop()
 
         for img in imgs:
-            clips.append(ImageClip(str(img), duration=per_image_dur))
-            img_count += 1
+            clips.append(ImageClip(str(img), duration=per_image_duration))
+            used += 1
 
     video = concatenate_videoclips(clips, method="compose", padding=0)
 
-    video = video.with_audio(audio) if hasattr(video, "with_audio") else video.set_audio(audio)
+    # Attach audio; trim audio to video length (or vice versa) safely
+    # (They should match closely; this avoids tiny drift.)
+    final_dur = video.duration
+    if hasattr(audio, "subclip") and audio.duration > final_dur:
+        audio = audio.subclip(0, final_dur)
+
+    if hasattr(video, "with_audio"):
+        video = video.with_audio(audio)
+    else:
+        video = video.set_audio(audio)
 
     out = VID_DIR / "final_reel.mp4"
     video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
 
-    if DEBUG:
-        st.write("Base narration length (seconds):", round(base_audio_dur, 2))
-        st.write("Final video length (seconds):", round(video.duration, 2))
-        st.write("Images used:", img_count)
-
-    st.success("Done. Narration will keep speaking until 60s.")
+    st.success(f"Done. Length: {video.duration:.1f}s • Scenes: {scenes} • Images: {used}")
     st.video(str(out))
     st.download_button("Download MP4", open(out, "rb"), "reel.mp4", mime="video/mp4")
