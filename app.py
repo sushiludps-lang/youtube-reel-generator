@@ -1,284 +1,442 @@
+import json
 import os
 import re
 import time
-import textwrap
 from pathlib import Path
+from typing import List, Dict, Any
 
+import numpy as np
 import requests
 import streamlit as st
 from gtts import gTTS
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# ✅ Cloud-safe MoviePy v1 import
+# MoviePy v1.0.3 stable import (Streamlit Cloud safe)
 from moviepy.editor import (
     ImageClip,
     AudioFileClip,
+    CompositeVideoClip,
     concatenate_videoclips,
+    concatenate_audioclips,
+    AudioClip,
     vfx,
 )
 
-# Ensure ffmpeg exists (Streamlit Cloud)
+# FFmpeg path for Streamlit Cloud
 try:
     import imageio_ffmpeg
     os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     pass
 
-# =============================
-# CONFIG
-# =============================
-WIDTH, HEIGHT = 1080, 1920
-FPS = 30
+# Google GenAI SDK
+from google import genai
+from google.genai import types
 
-IMAGES_PER_SCENE = 2            # ✅ required
-CROSSFADE_SECONDS = 0.5         # ✅ smooth transition, no black gaps
-
-# Caption style
-CAPTION_FONT_SIZE = 72
-TITLE_FONT_SIZE = 52
-BOTTOM_MARGIN = 120
-
+# =========================
+# Paths / Storage
+# =========================
 BASE = Path(__file__).parent
 IMG_DIR = BASE / "images"
 AUD_DIR = BASE / "audio"
 VID_DIR = BASE / "video"
+CACHE_DIR = BASE / "cache"
 
-for d in (IMG_DIR, AUD_DIR, VID_DIR):
+for d in (IMG_DIR, AUD_DIR, VID_DIR, CACHE_DIR):
     d.mkdir(exist_ok=True)
 
-PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]  # required on Streamlit Cloud
+TOPIC_HISTORY_FILE = CACHE_DIR / "topics_history.json"
+REELS_DB_FILE = CACHE_DIR / "reels_db.json"
 
-# =============================
-# HELPERS
-# =============================
+# =========================
+# Secrets
+# =========================
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+TEXT_MODEL = "models/gemini-2.5-flash"
+
+# =========================
+# Video constants
+# =========================
+W, H = 1080, 1920
+FPS = 30
+SCENE_SECONDS = 10
+IMAGES_PER_SCENE = 2
+IMG_SECONDS = SCENE_SECONDS / IMAGES_PER_SCENE  # 5s each
+CROSSFADE = 0.6  # smooth crossfade (no black gap)
+AUDIO_FPS = 44100
+
+# Subtitle styling
+SUB_FONT_SIZE = 64
+SUB_MARGIN_BOTTOM = 140
+SUB_BOX_PAD_X = 60
+SUB_BOX_PAD_Y = 36
+SUB_BOX_RADIUS = 36
+
+# =========================
+# Utilities
+# =========================
 def slugify(t: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", (t or "").lower()).strip("_")[:70] or "reel"
+    t = (t or "").lower().strip()
+    t = re.sub(r"[^a-z0-9]+", "_", t)
+    return t.strip("_")[:70] or "reel"
 
-def load_font(size, bold=False):
-    # Works on Streamlit Cloud
-    paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else
+def load_json(path: Path, default):
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+    return default
+
+def save_json(path: Path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def ensure_history() -> List[str]:
+    return load_json(TOPIC_HISTORY_FILE, [])
+
+def ensure_db() -> Dict[str, Any]:
+    return load_json(REELS_DB_FILE, {"reels": {}})
+
+def pexels_search(query: str, per_page: int = 20) -> List[Dict[str, Any]]:
+    r = requests.get(
+        "https://api.pexels.com/v1/search",
+        headers={"Authorization": PEXELS_API_KEY},
+        params={"query": query, "per_page": per_page, "orientation": "portrait"},
+        timeout=25,
+    )
+    r.raise_for_status()
+    return r.json().get("photos", [])
+
+def download_image(url: str, out_path: Path) -> Path:
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+    r.raise_for_status()
+    out_path.write_bytes(r.content)
+    return out_path
+
+def open_and_fit(path: Path) -> Image.Image:
+    img = Image.open(path).convert("RGB")
+    img = ImageOps.exif_transpose(img)
+    img = img.resize((W, H))
+    return img
+
+def make_placeholder(out_path: Path, text: str) -> Path:
+    img = Image.new("RGB", (W, H), (20, 20, 26))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+    draw.text((60, 80), "PLACEHOLDER", fill=(220, 220, 220), font=font)
+    draw.text((60, 140), text[:220], fill=(230, 230, 230), font=font)
+    img.save(out_path, quality=95)
+    return out_path
+
+# =========================
+# Subtitles as overlay frames (NOT burned onto images)
+# =========================
+def load_font(size: int) -> ImageFont.FreeTypeFont:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf",
+        "DejaVuSans.ttf",
     ]
-    for p in paths:
+    for p in candidates:
         try:
             return ImageFont.truetype(p, size)
         except Exception:
             continue
     return ImageFont.load_default()
 
-FONT_CAPTION = load_font(CAPTION_FONT_SIZE, bold=True)
-FONT_TITLE = load_font(TITLE_FONT_SIZE, bold=True)
+SUB_FONT = load_font(SUB_FONT_SIZE)
 
-def words_count(s: str) -> int:
-    return len(re.findall(r"\b\w+\b", s or ""))
+def wrap_lines(text: str, max_chars: int = 28) -> List[str]:
+    words = (text or "").strip().split()
+    lines, cur = [], []
+    for w in words:
+        test = " ".join(cur + [w])
+        if len(test) <= max_chars:
+            cur.append(w)
+        else:
+            if cur:
+                lines.append(" ".join(cur))
+            cur = [w]
+    if cur:
+        lines.append(" ".join(cur))
+    return lines[:2] or [""]
 
-def estimate_seconds_for_words(w: int, wpm: int = 155) -> float:
-    # gTTS typically around 140–170 wpm, use 155 as default
-    return (w / wpm) * 60.0
+def rounded_rect(draw: ImageDraw.ImageDraw, xy, radius, fill):
+    draw.rounded_rectangle(xy, radius=radius, fill=fill)
 
-def split_sentences(topic: str):
-    t = (topic or "").lower()
-
-    if "fire" in t and "shadow" in t:
-        return [
-            "Why does fire have no shadow?",
-            "A shadow forms when an object blocks light.",
-            "But fire is not a solid object—it emits light.",
-            "Flames are hot glowing gases plus tiny glowing particles.",
-            "That extra light fills the dark region where a shadow would appear.",
-            "So any shadow becomes weak, blurry, or disappears.",
-            "Try a bright flashlight behind a candle to force a faint shadow.",
-            "That’s why fire usually looks like it has no shadow.",
-        ]
-
-    if "hiccup" in t:
-        return [
-            "Why do hiccups happen?",
-            "Your diaphragm suddenly contracts.",
-            "Air rushes in fast.",
-            "Your vocal cords snap shut—hic!",
-            "Triggers include eating fast, soda, or temperature changes.",
-            "Most hiccups stop on their own in minutes.",
-            "Holding your breath can raise CO2 and sometimes helps.",
-        ]
-
-    return [
-        topic.strip() or "Quick science explanation",
-        "Here’s what’s happening in simple terms.",
-        "It comes down to how energy moves through the system.",
-        "Once you see the mechanism, it becomes intuitive.",
-        "Follow for more quick science reels.",
-    ]
-
-def expand_script_to_target(script_lines, target_seconds: int) -> list:
-    """
-    Ensures reels don’t become 10–15s:
-    We expand the *spoken* script (not silence) until it hits target duration.
-    """
-    topic = script_lines[0] if script_lines else "Topic"
-    base = " ".join(script_lines)
-    w = words_count(base)
-    est = estimate_seconds_for_words(w)
-
-    fillers = [
-        "Here’s a simple way to test it at home.",
-        "If you change the background light, the effect becomes more obvious.",
-        "The key idea is that brightness can hide shadows.",
-        "This happens because the flame adds light in many directions.",
-        "That’s why the shadow, if any, looks soft rather than sharp.",
-        "One more detail: a shadow needs a strong, single-direction light source.",
-        "When light is scattered or added, shadows wash out.",
-    ]
-
-    i = 0
-    out = list(script_lines)
-    while est < target_seconds - 2 and i < 30:
-        out.append(fillers[i % len(fillers)])
-        w = words_count(" ".join(out))
-        est = estimate_seconds_for_words(w)
-        i += 1
-
-    # Optional CTA at end
-    if out and not re.search(r"\bfollow\b|\bsubscribe\b", out[-1].lower()):
-        out.append("Follow for more 60-second science.")
-    return out
-
-def pexels_search(query: str):
-    r = requests.get(
-        "https://api.pexels.com/v1/search",
-        headers={"Authorization": PEXELS_API_KEY},
-        params={"query": query, "per_page": 20, "orientation": "portrait"},
-        timeout=25,
-    )
-    r.raise_for_status()
-    return r.json().get("photos", [])
-
-def fetch_image(url: str, out_path: Path) -> Path:
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
-    r.raise_for_status()
-    out_path.write_bytes(r.content)
-    return out_path
-
-def improve_background(img: Image.Image) -> Image.Image:
-    # Prevent “too dark / dull” look
-    img = img.convert("RGB")
-    img = ImageEnhance.Brightness(img).enhance(1.08)
-    img = ImageEnhance.Contrast(img).enhance(1.10)
-    return img
-
-def draw_caption_on_image(img: Image.Image, caption: str, title: str) -> Image.Image:
-    img = ImageOps.exif_transpose(img).convert("RGB")
-    img = img.resize((WIDTH, HEIGHT))
-    img = improve_background(img)
-
+def make_subtitle_png(text: str, out_path: Path) -> Path:
+    # Transparent subtitle layer
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Top title pill
-    title = (title or "").strip()
-    if title:
-        title_lines = textwrap.wrap(title, width=26)[:2]
-        title_text = "\n".join(title_lines)
-        tb = draw.multiline_textbbox((0, 0), title_text, font=FONT_TITLE, spacing=8)
-        tw, th = tb[2] - tb[0], tb[3] - tb[1]
-        x1 = (WIDTH - tw) // 2 - 26
-        y1 = 50
-        x2 = (WIDTH + tw) // 2 + 26
-        y2 = y1 + th + 24
-        draw.rounded_rectangle((x1, y1, x2, y2), radius=26, fill=(10, 10, 12))
-        draw.multiline_text((x1 + 26, y1 + 10), title_text, font=FONT_TITLE, fill="white", spacing=8)
-
-    # Bottom caption card (big)
-    lines = textwrap.wrap((caption or "").strip(), width=26)[:3] or [""]
-    line_h = CAPTION_FONT_SIZE + 12
-    box_h = 60 + len(lines) * line_h
-
-    y2 = HEIGHT - BOTTOM_MARGIN
-    y1 = y2 - box_h
-    x1, x2 = 70, WIDTH - 70
-
-    draw.rounded_rectangle((x1, y1, x2, y2), radius=42, fill=(10, 10, 12))
-    y = y1 + 30
+    lines = wrap_lines(text, max_chars=28)
+    # Measure
+    spacing = 10
+    widths = []
+    heights = []
     for line in lines:
-        draw.text((x1 + 50, y), line, font=FONT_CAPTION, fill="white")
-        y += line_h
+        bbox = draw.textbbox((0, 0), line, font=SUB_FONT)
+        widths.append(bbox[2] - bbox[0])
+        heights.append(bbox[3] - bbox[1])
 
-    return img
+    text_w = max(widths) if widths else 0
+    text_h = sum(heights) + spacing * (len(lines) - 1)
 
-def make_placeholder(caption: str, title: str, out: Path) -> Path:
-    img = Image.new("RGB", (WIDTH, HEIGHT), (22, 22, 26))
-    img = draw_caption_on_image(img, caption, title)
-    img.save(out, quality=95)
-    return out
+    box_w = text_w + 2 * SUB_BOX_PAD_X
+    box_h = text_h + 2 * SUB_BOX_PAD_Y
 
-def get_scene_images(scene_text: str, title: str, reel_id: str, scene_i: int) -> list[Path]:
-    """
-    Returns exactly IMAGES_PER_SCENE images.
-    If Pexels fails or returns empty, returns placeholders.
-    """
-    paths = []
-    try:
-        photos = pexels_search(scene_text)
-    except Exception:
-        photos = []
+    x1 = (W - box_w) // 2
+    y2 = H - SUB_MARGIN_BOTTOM
+    y1 = y2 - box_h
+    x2 = x1 + box_w
 
-    picks = photos[:IMAGES_PER_SCENE] if photos else []
-    for j in range(1, IMAGES_PER_SCENE + 1):
-        out = IMG_DIR / f"{reel_id}_s{scene_i:02d}_i{j:02d}.jpg"
-        if j <= len(picks):
-            src = picks[j - 1].get("src", {})
-            url = src.get("portrait") or src.get("large2x") or src.get("large")
-            if url:
-                try:
-                    fetch_image(url, out)
-                    img = Image.open(out)
-                    img = draw_caption_on_image(img, scene_text, title)
-                    img.save(out, quality=95)
-                    paths.append(out)
-                    continue
-                except Exception:
-                    pass
-        paths.append(make_placeholder(scene_text, title, out))
-    return paths
+    # Dark box
+    rounded_rect(draw, (x1, y1, x2, y2), SUB_BOX_RADIUS, fill=(10, 10, 12, 220))
 
-def concatenate_with_crossfade(clips, d: float):
-    """
-    Smooth transition WITHOUT black gaps:
-    - apply crossfadein on each clip (except first)
-    - concatenate with negative padding (overlap)
-    """
-    if not clips:
-        raise ValueError("No clips to concatenate.")
+    # Draw lines centered
+    y = y1 + SUB_BOX_PAD_Y
+    for i, line in enumerate(lines):
+        bbox = draw.textbbox((0, 0), line, font=SUB_FONT)
+        lw = bbox[2] - bbox[0]
+        lx = (W - lw) // 2
+        draw.text((lx, y), line, font=SUB_FONT, fill=(255, 255, 255, 255))
+        y += heights[i] + spacing
 
-    d = max(0.0, float(d))
-    if d <= 0:
-        return concatenate_videoclips(clips, method="compose")
+    img.save(out_path)
+    return out_path
 
-    out = [clips[0]]
-    for c in clips[1:]:
-        out.append(c.crossfadein(d))
+# =========================
+# Audio: per scene -> exactly 10s
+# =========================
+def silence_audio(duration: float) -> AudioClip:
+    def make_frame(t):
+        # mono silence
+        return np.zeros((1,), dtype=np.float32)
+    return AudioClip(make_frame, duration=duration, fps=AUDIO_FPS)
 
-    # padding=-d overlaps clips by d seconds -> smooth dissolve
-    return concatenate_videoclips(out, method="compose", padding=-d)
+def fit_audio_to_duration(audio: AudioFileClip, duration: float) -> AudioClip:
+    if audio.duration > duration:
+        return audio.subclip(0, duration)
+    if audio.duration < duration:
+        pad = silence_audio(duration - audio.duration)
+        return concatenate_audioclips([audio, pad]).set_duration(duration)
+    return audio
 
-def build_video_from_images_and_audio(image_paths: list[Path], audio_path: Path, crossfade: float) -> Path:
-    audio = AudioFileClip(str(audio_path))
-    total_dur = float(audio.duration)
+def make_scene_audio(scene_text: str, out_mp3: Path, duration: float) -> AudioClip:
+    gTTS(scene_text).save(str(out_mp3))
+    a = AudioFileClip(str(out_mp3))
+    a2 = fit_audio_to_duration(a, duration)
+    return a2
 
-    n = max(1, len(image_paths))
-    per_img = total_dur / n
+# =========================
+# Gemini: Topics (20) without overlap
+# =========================
+def gemini_generate_topics(existing: List[str], n: int = 20) -> List[str]:
+    existing_lower = {e.strip().lower() for e in existing if e.strip()}
+    prompt = f"""
+Return ONLY valid JSON (no markdown, no commentary).
 
-    clips = []
-    for p in image_paths:
-        c = ImageClip(str(p)).set_duration(per_img)
-        clips.append(c)
+Generate {n} unique YouTube Shorts science/curiosity topics.
+Constraints:
+- Each topic should be a short question (max 12 words).
+- Avoid duplicates and near-duplicates.
+- Avoid any topic that matches this existing list (case-insensitive):
+{list(existing_lower)[:300]}
 
-    video = concatenate_with_crossfade(clips, d=min(crossfade, per_img * 0.45))
-    video = video.set_audio(audio)
+JSON format exactly:
+{{"topics": ["topic 1", "topic 2", "..."]}}
+"""
+    resp = client.models.generate_content(
+        model=TEXT_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    raw = (resp.text or "").strip()
+    data = json.loads(raw)
+    topics = []
+    for t in data.get("topics", []):
+        t = (t or "").strip()
+        if not t:
+            continue
+        if t.lower() in existing_lower:
+            continue
+        topics.append(t)
+        existing_lower.add(t.lower())
+        if len(topics) >= n:
+            break
+    return topics
 
-    out = VID_DIR / f"reel_{int(time.time())}.mp4"
-    video.write_videofile(
+# =========================
+# Gemini: Script for N scenes (each 10s)
+# =========================
+def gemini_script(topic: str, scenes: int) -> Dict[str, Any]:
+    prompt = f"""
+Return ONLY valid JSON (no markdown, no commentary).
+
+Create a short script for a YouTube Short topic.
+Topic: "{topic}"
+
+Rules:
+- Exactly {scenes} scenes.
+- Each scene should be spoken in ~10 seconds.
+- Each scene should have:
+  - "subtitle": short spoken line(s) for that 10s scene (1–2 sentences)
+  - "image_query": a search phrase for stock footage/images for that scene
+- Keep it accurate and simple.
+- Do NOT mention any other topics.
+
+JSON format exactly:
+{{
+  "title": "{topic}",
+  "scenes": [
+    {{"subtitle": " ... ", "image_query": " ... "}},
+    ...
+  ]
+}}
+"""
+    resp = client.models.generate_content(
+        model=TEXT_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    raw = (resp.text or "").strip()
+    data = json.loads(raw)
+
+    # Hard enforce scene count
+    scenes_list = data.get("scenes", [])
+    if not isinstance(scenes_list, list):
+        scenes_list = []
+    scenes_list = scenes_list[:scenes]
+    while len(scenes_list) < scenes:
+        scenes_list.append({"subtitle": "One simple fact about this.", "image_query": topic})
+
+    # Clean
+    cleaned = []
+    for s in scenes_list:
+        subtitle = (s.get("subtitle") or "").strip()
+        image_query = (s.get("image_query") or topic).strip()
+        if not subtitle:
+            subtitle = "Here is the key idea in simple terms."
+        cleaned.append({"subtitle": subtitle, "image_query": image_query})
+
+    return {"title": topic, "scenes": cleaned}
+
+# =========================
+# Build one reel
+# =========================
+def build_reel(topic: str, script: Dict[str, Any], reel_index: int, progress_cb=None) -> Path:
+    start = time.time()
+
+    def cb(p: float, msg: str):
+        if progress_cb:
+            progress_cb(p, msg, time.time() - start)
+
+    cb(0.02, "Preparing script...")
+    scenes = script["scenes"]
+    scenes_count = len(scenes)
+    total_seconds = scenes_count * SCENE_SECONDS
+
+    reel_id = f"reel{reel_index:02d}_{slugify(topic)}_{int(time.time())}"
+
+    # 1) Images
+    cb(0.08, "Fetching images...")
+    all_scene_image_pairs: List[List[Path]] = []
+    for i, sc in enumerate(scenes, start=1):
+        q = sc["image_query"]
+        paths = []
+        try:
+            photos = pexels_search(q, per_page=25)
+        except Exception:
+            photos = []
+
+        # pick 2 images
+        picked = photos[:IMAGES_PER_SCENE] if photos else []
+
+        for j in range(1, IMAGES_PER_SCENE + 1):
+            out = IMG_DIR / f"{reel_id}_s{i:02d}_i{j:02d}.jpg"
+            if j <= len(picked):
+                src = picked[j - 1].get("src", {})
+                url = src.get("portrait") or src.get("large2x") or src.get("large")
+                if url:
+                    try:
+                        download_image(url, out)
+                        # Ensure size is correct
+                        img = open_and_fit(out)
+                        img.save(out, quality=92)
+                        paths.append(out)
+                        continue
+                    except Exception:
+                        pass
+            # fallback placeholder
+            paths.append(make_placeholder(out, f"{topic} / scene {i}"))
+        all_scene_image_pairs.append(paths)
+        cb(0.08 + 0.35 * (i / scenes_count), f"Images {i}/{scenes_count}")
+
+        time.sleep(0.15)
+
+    # 2) Audio per scene => exactly 10s, then concatenate
+    cb(0.45, "Generating voiceover (scene-synced)...")
+    audio_clips = []
+    for i, sc in enumerate(scenes, start=1):
+        mp3 = AUD_DIR / f"{reel_id}_scene_{i:02d}.mp3"
+        a = make_scene_audio(sc["subtitle"], mp3, duration=SCENE_SECONDS)
+        audio_clips.append(a)
+        cb(0.45 + 0.18 * (i / scenes_count), f"Voiceover {i}/{scenes_count}")
+
+    full_audio = concatenate_audioclips(audio_clips).set_duration(total_seconds)
+
+    # 3) Build video: each scene = 10s = 2 images x 5s with crossfade
+    cb(0.68, "Building video (subtitles + transitions)...")
+    scene_videos = []
+    for i, sc in enumerate(scenes, start=1):
+        imgs = all_scene_image_pairs[i - 1]
+        subtitle = sc["subtitle"]
+
+        # Create two image clips of 5s each
+        c1 = ImageClip(str(imgs[0])).set_duration(IMG_SECONDS)
+        c2 = ImageClip(str(imgs[1])).set_duration(IMG_SECONDS)
+
+        # Smooth micro motion (optional)
+        c1 = c1.fx(vfx.resize, 1.03)
+        c2 = c2.fx(vfx.resize, 1.03)
+
+        # Crossfade between the 2 images (within the scene)
+        d = min(CROSSFADE, IMG_SECONDS * 0.45)
+        c2 = c2.crossfadein(d)
+        scene_clip = concatenate_videoclips([c1, c2], method="compose", padding=-d).set_duration(SCENE_SECONDS)
+
+        # Subtitle overlay for entire 10s
+        sub_png = IMG_DIR / f"{reel_id}_sub_{i:02d}.png"
+        make_subtitle_png(subtitle, sub_png)
+        sub_clip = ImageClip(str(sub_png)).set_duration(SCENE_SECONDS)
+
+        # Compose subtitle on top
+        composed = CompositeVideoClip([scene_clip, sub_clip], size=(W, H)).set_duration(SCENE_SECONDS)
+
+        # Attach this scene's audio (exact 10s)
+        composed = composed.set_audio(audio_clips[i - 1]).set_duration(SCENE_SECONDS)
+
+        scene_videos.append(composed)
+        cb(0.68 + 0.20 * (i / scenes_count), f"Scene {i}/{scenes_count}")
+
+    # Crossfade between scenes too (very smooth)
+    d_scene = min(CROSSFADE, 0.8)
+    for k in range(1, len(scene_videos)):
+        scene_videos[k] = scene_videos[k].crossfadein(d_scene)
+    final_video = concatenate_videoclips(scene_videos, method="compose", padding=-d_scene).set_duration(total_seconds)
+
+    # Ensure full audio is applied (backup)
+    final_video = final_video.set_audio(full_audio).set_duration(total_seconds)
+
+    # 4) Export
+    cb(0.92, "Exporting MP4...")
+    out = VID_DIR / f"{reel_id}.mp4"
+    final_video.write_videofile(
         str(out),
         fps=FPS,
         codec="libx264",
@@ -288,49 +446,114 @@ def build_video_from_images_and_audio(image_paths: list[Path], audio_path: Path,
         ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
         logger=None,
     )
-
+    cb(1.0, "Done.")
     try:
-        video.close()
-        audio.close()
+        final_video.close()
     except Exception:
         pass
-
     return out
 
-def build_reel(topic: str, target_seconds: int, pexels_delay: float = 0.2) -> Path:
-    # 1) Script
-    base_script = split_sentences(topic)
-    script = expand_script_to_target(base_script, target_seconds=target_seconds)
-
-    # 2) Voiceover
-    narration = " ".join(script)
-    audio_path = AUD_DIR / f"voice_{int(time.time())}.mp3"
-    gTTS(narration).save(str(audio_path))
-
-    # 3) Images (2 per scene)
-    reel_id = slugify(topic) + "_" + str(int(time.time()))
-    all_imgs: list[Path] = []
-    for i, scene_text in enumerate(script, start=1):
-        all_imgs.extend(get_scene_images(scene_text, topic, reel_id, i))
-        time.sleep(pexels_delay)
-
-    # 4) Video (duration == narration duration; transitions crossfade)
-    return build_video_from_images_and_audio(all_imgs, audio_path, crossfade=CROSSFADE_SECONDS)
-
-# =============================
+# =========================
 # UI
-# =============================
-st.title("YouTube Reel Generator (Transitions + Captions + Correct Duration)")
+# =========================
+st.set_page_config(page_title="Reel Factory", layout="wide")
+st.title("Reel Factory — Gemini Script + Pexels Images + Subtitle Overlay")
 
-topic = st.text_input("Topic", value="Why does fire have no shadow?")
-target_seconds = st.slider("Target reel length (seconds)", 15, 75, 60, 5)
-pexels_delay = st.slider("Delay between Pexels calls (seconds)", 0.0, 1.5, 0.2, 0.1)
-crossfade = st.slider("Transition smoothness (crossfade seconds)", 0.0, 1.0, 0.5, 0.05)
-CROSSFADE_SECONDS = crossfade  # apply user setting
+# Init session state
+if "topics_20" not in st.session_state:
+    st.session_state["topics_20"] = []
+if "selected_topic" not in st.session_state:
+    st.session_state["selected_topic"] = ""
+if "scenes" not in st.session_state:
+    st.session_state["scenes"] = 6  # default 6 scenes of 10s => 60s
 
-if st.button("Generate Reel"):
-    with st.spinner("Generating script, images, audio, and video..."):
-        mp4 = build_reel(topic, target_seconds=target_seconds, pexels_delay=pexels_delay)
-    st.success("Done!")
-    st.video(str(mp4))
-    st.download_button("Download MP4", open(mp4, "rb"), file_name=Path(mp4).name, mime="video/mp4")
+colA, colB = st.columns([1.1, 0.9])
+
+with colA:
+    st.subheader("Step 1 — Generate 20 Topics (non-overlapping)")
+    scenes = st.selectbox("Scenes per reel", options=[6, 8], index=0)  # you can choose 6 or 8
+    st.session_state["scenes"] = scenes
+    total_len = scenes * SCENE_SECONDS
+    st.caption(f"Each scene is {SCENE_SECONDS}s → Reel length ≈ {total_len}s")
+
+    if st.button("Generate 20 New Topics"):
+        history = ensure_history()
+        with st.spinner("Asking Gemini for 20 new topics..."):
+            topics = gemini_generate_topics(history, n=20)
+        history.extend([t.lower() for t in topics])
+        # de-dupe history
+        history = list(dict.fromkeys(history))
+        save_json(TOPIC_HISTORY_FILE, history)
+        st.session_state["topics_20"] = topics
+        if topics:
+            st.session_state["selected_topic"] = topics[0]
+
+    if st.session_state["topics_20"]:
+        # Dropdown list Reel 1..20
+        labels = [f"Reel {i+1}: {t}" for i, t in enumerate(st.session_state["topics_20"])]
+        chosen = st.selectbox("Select a reel topic", options=labels, index=0)
+        idx = labels.index(chosen)
+        topic = st.session_state["topics_20"][idx]
+        st.session_state["selected_topic"] = topic
+        st.write("Selected topic:")
+        st.code(topic)
+    else:
+        st.info("Click 'Generate 20 New Topics' to populate the dropdown.")
+
+with colB:
+    st.subheader("Step 2 — Create Script + Build Video")
+    topic = st.session_state.get("selected_topic", "").strip()
+    if not topic:
+        st.warning("Generate topics and select one first.")
+    else:
+        db = ensure_db()
+        reel_key = topic.lower()
+
+        exists = reel_key in db["reels"]
+        if exists:
+            st.success("This topic already has a saved script/video.")
+            st.json(db["reels"][reel_key]["script"])
+            vp = db["reels"][reel_key].get("video_path")
+            if vp and Path(vp).exists():
+                st.video(vp)
+
+        if st.button("Generate Script (Gemini)"):
+            with st.spinner("Generating script from Gemini..."):
+                script = gemini_script(topic, scenes=st.session_state["scenes"])
+            # store script even before video
+            db["reels"][reel_key] = db["reels"].get(reel_key, {})
+            db["reels"][reel_key]["topic"] = topic
+            db["reels"][reel_key]["script"] = script
+            db["reels"][reel_key]["updated_at"] = int(time.time())
+            save_json(REELS_DB_FILE, db)
+            st.success("Script saved.")
+            st.json(script)
+
+        db = ensure_db()
+        script = db["reels"].get(reel_key, {}).get("script")
+
+        if script:
+            st.caption("Build uses: 2 images/scene, subtitles overlay, smooth crossfade, scene-synced voiceover (10s per scene).")
+
+            progress = st.progress(0)
+            status = st.empty()
+            eta = st.empty()
+
+            def cb(p, msg, elapsed):
+                progress.progress(int(p * 100))
+                status.write(f"{int(p*100)}% — {msg}")
+                if p > 0:
+                    remaining = (elapsed / p) - elapsed
+                    eta.write(f"ETA ~ {int(max(0, remaining))}s")
+
+            if st.button("Build Video (MP4)"):
+                with st.spinner("Building MP4..."):
+                    out = build_reel(topic, script, reel_index=1, progress_cb=cb)
+                db = ensure_db()
+                db["reels"][reel_key]["video_path"] = str(out)
+                db["reels"][reel_key]["updated_at"] = int(time.time())
+                save_json(REELS_DB_FILE, db)
+
+                st.success("Video created and saved.")
+                st.video(str(out))
+                st.download_button("Download MP4", open(out, "rb"), file_name=out.name, mime="video/mp4")
