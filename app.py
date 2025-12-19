@@ -1,5 +1,6 @@
 import json
 import random
+from io import BytesIO
 from pathlib import Path
 
 import requests
@@ -26,7 +27,6 @@ BASE = Path(__file__).parent
 IMG_DIR = BASE / "images"
 AUD_DIR = BASE / "audio"
 VID_DIR = BASE / "video"
-
 IMG_DIR.mkdir(exist_ok=True)
 AUD_DIR.mkdir(exist_ok=True)
 VID_DIR.mkdir(exist_ok=True)
@@ -45,10 +45,10 @@ if not gemini_key:
     st.error("Missing GEMINI_API_KEY in Secrets.")
     st.stop()
 
+PEXELS_KEY = st.secrets.get("PEXELS_API_KEY", "")
+
 client = genai.Client(api_key=gemini_key)
 TEXT_MODEL = "gemini-2.5-flash"
-
-PEXELS_KEY = st.secrets.get("PEXELS_API_KEY", "")
 
 # -----------------------
 # UI inputs
@@ -57,6 +57,10 @@ topic = st.text_input("Enter a topic for the YouTube Reel", value="Why does fire
 num_scenes = st.slider("Number of scenes", 5, 10, 7)
 
 image_source = st.selectbox("Image source", ["Pexels (free key)", "Placeholders only"], index=0)
+show_debug = st.toggle("Show image debug", value=True)
+
+if image_source.startswith("Pexels") and not PEXELS_KEY:
+    st.warning("PEXELS_API_KEY is missing. Add it in Streamlit Cloud → Manage app → Settings → Secrets.")
 
 # -----------------------
 # Helpers
@@ -71,6 +75,7 @@ def make_placeholder_image(text: str, idx: int) -> Path:
     img = Image.new("RGB", (1080, 1920), (15, 15, 20))
     draw = ImageDraw.Draw(img)
     font = _load_font(64)
+
     draw.text((80, 120), f"Scene {idx}", fill=(200, 200, 200), font=font)
 
     words = text.split()
@@ -93,39 +98,45 @@ def make_placeholder_image(text: str, idx: int) -> Path:
     img.save(out)
     return out
 
-def pexels_search_image(query: str) -> str | None:
-    """Return a single portrait-ish image URL from Pexels."""
+@st.cache_data(show_spinner=False, ttl=3600)
+def pexels_search(query: str):
     if not PEXELS_KEY:
-        return None
+        return None, None, "PEXELS_API_KEY missing"
 
     headers = {"Authorization": PEXELS_KEY}
-    params = {"query": query, "per_page": 15}
-    r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=20)
+    params = {
+        "query": query,
+        "per_page": 20,
+        "orientation": "portrait",
+        "size": "large",
+    }
+    r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=25)
+
     if r.status_code != 200:
-        return None
+        return None, r.status_code, r.text[:500]
+
     data = r.json()
     photos = data.get("photos", [])
     if not photos:
-        return None
+        return None, 200, "No photos found"
 
-    # Prefer portrait src if available
-    choices = []
+    # Prefer portrait URL
+    urls = []
     for p in photos:
         src = p.get("src", {})
         if src.get("portrait"):
-            choices.append(src["portrait"])
+            urls.append(src["portrait"])
         elif src.get("large"):
-            choices.append(src["large"])
+            urls.append(src["large"])
 
-    return random.choice(choices) if choices else None
+    if not urls:
+        return None, 200, "Photos returned but no usable src URLs"
+
+    return random.choice(urls), 200, "OK"
 
 def download_and_fit_9x16(img_url: str, out_path: Path):
-    """Download image, center-crop to 9:16, resize to 1080x1920."""
     r = requests.get(img_url, timeout=30)
     r.raise_for_status()
-    img = Image.open(Path(out_path.parent) / "tmp_img").convert("RGB")  # dummy to satisfy type check
-
-    from io import BytesIO
     img = Image.open(BytesIO(r.content)).convert("RGB")
 
     target_w, target_h = 1080, 1920
@@ -134,31 +145,36 @@ def download_and_fit_9x16(img_url: str, out_path: Path):
     w, h = img.size
     src_ratio = w / h
 
+    # Center crop to 9:16
     if src_ratio > target_ratio:
-        # too wide -> crop width
         new_w = int(h * target_ratio)
         left = (w - new_w) // 2
         img = img.crop((left, 0, left + new_w, h))
     else:
-        # too tall -> crop height
         new_h = int(w / target_ratio)
         top = (h - new_h) // 2
         img = img.crop((0, top, w, top + new_h))
 
-    img = img.resize((target_w, target_h))
-    img.save(out_path)
+    img = img.resize((target_w, target_h), Image.LANCZOS)
+    img.save(out_path, format="PNG")
 
-def build_image_for_scene(scene_text: str, idx: int) -> Path:
-    """Use Pexels if available else placeholder."""
+def build_image_for_scene(scene_text: str, idx: int):
     if image_source.startswith("Pexels"):
-        url = pexels_search_image(scene_text)
+        url, status, msg = pexels_search(scene_text)
+        if show_debug:
+            with st.expander(f"Pexels debug (Scene {idx})", expanded=False):
+                st.write({"status": status, "message": msg, "url": url})
+
         if url:
             out = IMG_DIR / f"scene_{idx}.png"
             try:
                 download_and_fit_9x16(url, out)
                 return out
-            except Exception:
-                pass
+            except Exception as e:
+                if show_debug:
+                    with st.expander(f"Download/crop error (Scene {idx})", expanded=False):
+                        st.write(str(e))
+
     return make_placeholder_image(scene_text, idx)
 
 # -----------------------
@@ -214,6 +230,7 @@ Format EXACTLY:
 
     st.subheader("Scenes")
     progress = st.progress(0)
+
     for i, scene in enumerate(scenes, start=1):
         scene_text = str(scene)
         narration_parts.append(scene_text)
