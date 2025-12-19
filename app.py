@@ -1,8 +1,10 @@
 import json
+import random
 import re
 import textwrap
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -27,6 +29,7 @@ AUD_DIR = BASE / "audio"
 VID_DIR = BASE / "video"
 CACHE_DIR = BASE / "cache"
 CACHE_FILE = CACHE_DIR / "pexels_cache.json"
+TOPIC_HISTORY_FILE = CACHE_DIR / "topic_history.json"
 
 for d in (IMG_DIR, AUD_DIR, VID_DIR, CACHE_DIR):
     d.mkdir(exist_ok=True)
@@ -37,7 +40,7 @@ IMAGES_PER_SCENE = 2  # fixed
 # ===============================
 # UI
 # ===============================
-st.title("YouTube Reel Generator — Batch Mode (Streamlit Cloud)")
+st.title("YouTube Reel Generator — Batch Mode + Auto-Topics (No duplicates)")
 
 mode = st.radio("Mode", ["Single Reel", "Batch (20 Reels)"], horizontal=True)
 
@@ -52,7 +55,7 @@ CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 
 crossfade_seconds = st.slider("Crossfade seconds", 0.2, 1.2, 0.7)
 
-# Safety/rate-limit knobs (Pexels)
+# Pexels throttle
 pexels_delay = st.slider("Delay between Pexels calls (seconds)", 0.0, 1.5, 0.25)
 
 DEBUG = st.toggle("Show debug", False)
@@ -77,18 +80,40 @@ FONT = load_font(CAPTION_FONT_SIZE)
 # ===============================
 # CACHE (Pexels results -> local image files)
 # ===============================
-def load_cache():
-    if CACHE_FILE.exists():
+def load_json_file(path: Path, default):
+    if path.exists():
         try:
-            return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            return {}
-    return {}
+            return default
+    return default
 
-def save_cache(cache: dict):
-    CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+def save_json_file(path: Path, obj):
+    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
-PEXELS_CACHE = load_cache()
+PEXELS_CACHE = load_json_file(CACHE_FILE, {})
+
+def load_topic_history():
+    data = load_json_file(TOPIC_HISTORY_FILE, {"topics": []})
+    topics = data.get("topics", [])
+    # normalize + unique
+    norm = []
+    seen = set()
+    for t in topics:
+        t2 = (t or "").strip()
+        if not t2:
+            continue
+        k = t2.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        norm.append(t2)
+    return norm
+
+def save_topic_history(topics_list):
+    save_json_file(TOPIC_HISTORY_FILE, {"topics": topics_list, "updated_at": datetime.utcnow().isoformat()})
+
+TOPIC_HISTORY = load_topic_history()
 
 # ===============================
 # CAPTION BURN (PIL)
@@ -154,7 +179,6 @@ def fetch_images(scene_text: str):
     if len(cached_paths) >= IMAGES_PER_SCENE:
         return cached_paths[:IMAGES_PER_SCENE]
 
-    # otherwise fetch
     photos = pexels_search(scene_text)
     time.sleep(pexels_delay)
 
@@ -182,9 +206,8 @@ def fetch_images(scene_text: str):
     while len(paths) < IMAGES_PER_SCENE:
         paths.append(paths[-1])
 
-    # save cache
     PEXELS_CACHE[cache_key] = [str(p) for p in paths[:IMAGES_PER_SCENE]]
-    save_cache(PEXELS_CACHE)
+    save_json_file(CACHE_FILE, PEXELS_CACHE)
 
     return paths[:IMAGES_PER_SCENE]
 
@@ -273,7 +296,6 @@ def build_crossfade_video_synced(image_paths, audio_duration, xfade):
         start_t = i * step
         c = c.with_start(start_t) if hasattr(c, "with_start") else c.set_start(start_t)
 
-        # true crossfade if available
         if vfx is not None and hasattr(c, "with_effects"):
             effs = []
             if i > 0 and hasattr(vfx, "CrossFadeIn"):
@@ -293,16 +315,15 @@ def build_crossfade_video_synced(image_paths, audio_duration, xfade):
     return video
 
 # ===============================
-# Single reel builder (returns mp4 path)
+# SINGLE REEL BUILDER
 # ===============================
 def build_one_reel(topic: str, index: int):
-    script, voice_path, audio_duration = build_script(
+    script, voice_path, _dur = build_script(
         topic, target_scene_seconds, min_video_seconds, min_scenes, max_scenes
     )
 
     audio = AudioFileClip(str(voice_path))
 
-    # 2 images per scene
     image_paths = []
     for scene_text in script:
         imgs = fetch_images(scene_text)
@@ -317,7 +338,6 @@ def build_one_reel(topic: str, index: int):
     out = VID_DIR / f"reel_{index:02d}_{slugify(topic)}.mp4"
     video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
 
-    # cleanup
     try:
         video.close()
     except Exception:
@@ -330,11 +350,96 @@ def build_one_reel(topic: str, index: int):
     return out
 
 # ===============================
+# AUTO TOPIC GENERATOR (no duplicates)
+# ===============================
+PILLARS = {
+    "Physics": [
+        "light", "shadow", "heat", "sound", "electricity", "motion", "pressure", "gravity",
+        "friction", "waves", "reflection", "refraction"
+    ],
+    "Chemistry": [
+        "water", "salt", "soap", "oil", "rust", "bubbles", "glass", "ice", "sugar",
+        "coffee", "vinegar", "baking soda"
+    ],
+    "Biology": [
+        "sleep", "yawning", "heartbeat", "muscles", "brain", "eyes", "smell", "taste",
+        "skin", "sweat", "goosebumps", "hiccups"
+    ],
+    "Space": [
+        "moon", "stars", "black holes", "planets", "sun", "comets", "aurora",
+        "gravity in space", "time", "meteorites", "galaxies", "satellites"
+    ],
+    "Mind": [
+        "paradox", "illusion", "probability", "memory", "attention", "habit",
+        "placebo", "decision", "confidence", "bias", "pattern", "luck"
+    ],
+}
+
+TEMPLATES = [
+    "Why does {x} happen?",
+    "Why doesn’t {x} do what we expect?",
+    "What happens if {x} changes?",
+    "Most people think {x}, but is it true?",
+]
+
+def make_candidates():
+    candidates = []
+    for pillar, words in PILLARS.items():
+        for w in words:
+            for tpl in TEMPLATES:
+                q = tpl.format(x=w)
+                # keep short-ish
+                q = q.replace("  ", " ").strip()
+                if len(q) <= 60:
+                    candidates.append(q)
+    return candidates
+
+ALL_CANDIDATES = make_candidates()
+
+def generate_new_topics(n=20):
+    used = set(t.lower() for t in TOPIC_HISTORY)
+    # daily shuffle changes each day
+    seed = int(datetime.utcnow().strftime("%Y%m%d"))
+    rng = random.Random(seed + random.randint(0, 10_000_000))
+
+    pool = ALL_CANDIDATES[:]
+    rng.shuffle(pool)
+
+    out = []
+    for q in pool:
+        k = q.lower().strip()
+        if k in used:
+            continue
+        out.append(q)
+        used.add(k)
+        if len(out) >= n:
+            break
+
+    return out
+
+def remember_topics(topics):
+    global TOPIC_HISTORY
+    cur = TOPIC_HISTORY[:]
+    s = set(t.lower() for t in cur)
+    for t in topics:
+        t2 = (t or "").strip()
+        if not t2:
+            continue
+        k = t2.lower()
+        if k in s:
+            continue
+        cur.append(t2)
+        s.add(k)
+    TOPIC_HISTORY = cur
+    save_topic_history(TOPIC_HISTORY)
+
+# ===============================
 # UI: Single or Batch
 # ===============================
 if mode == "Single Reel":
     topic_single = st.text_input("Single topic", "Why does fire have no shadow?")
     if st.button("Generate 1 Reel"):
+        remember_topics([topic_single])
         with st.spinner("Generating..."):
             mp4_path = build_one_reel(topic_single, 1)
         st.success("Done.")
@@ -342,43 +447,49 @@ if mode == "Single Reel":
         st.download_button("Download MP4", open(mp4_path, "rb"), mp4_path.name, mime="video/mp4")
 
 else:
-    topics_text = st.text_area(
-        "Paste up to 20 topics (one per line)",
-        value="\n".join([
-            "Why does fire have no shadow?",
-            "Why is the sky blue?",
-            "Why do we see lightning before thunder?",
-            "Why does ice float on water?",
-            "Why does metal feel colder than wood?",
-            "Why do onions make you cry?",
-            "Why do bubbles look rainbow-colored?",
-            "Why does salt melt ice?",
-            "Why does the moon look bigger near the horizon?",
-            "Why do headphones get tangled so easily?",
-            "Why do we yawn when others yawn?",
-            "Why do cats land on their feet?",
-            "Why do leaves change color?",
-            "Why does coffee smell stronger than it tastes?",
-            "Why do magnets stick to some metals only?",
-            "Why do we get goosebumps?",
-            "Why does glass look solid but is actually a liquid myth?",
-            "Why does popcorn pop?",
-            "Why do airplanes leave white trails?",
-            "Why do candles flicker?",
-        ])
-    )
+    col1, col2 = st.columns([2, 1], vertical_alignment="top")
 
-    if st.button("Generate Batch (20 Reels)"):
+    with col1:
+        topics_text = st.text_area(
+            "Topics (one per line) — use Auto-generate to fill",
+            value="",
+            height=320,
+            placeholder="Click Auto-generate 20 new topics…"
+        )
+
+    with col2:
+        st.subheader("Auto topics")
+        if st.button("Auto-generate 20 NEW topics"):
+            new_topics = generate_new_topics(20)
+            if not new_topics:
+                st.error("No new topics left in the pool (increase pool or clear history).")
+            else:
+                # remember immediately so next click doesn't repeat
+                remember_topics(new_topics)
+                st.session_state["topics_text_autofill"] = "\n".join(new_topics)
+                st.rerun()
+
+        if st.button("Clear topic history (start over)"):
+            save_topic_history([])
+            st.session_state["topics_text_autofill"] = ""
+            st.rerun()
+
+        st.caption(f"Remembered topics: {len(TOPIC_HISTORY)}")
+
+    # apply autofill into textbox (safe)
+    if "topics_text_autofill" in st.session_state and st.session_state["topics_text_autofill"]:
+        topics_text = st.session_state["topics_text_autofill"]
+
+    if st.button("Generate Batch (up to 20 Reels)"):
         topics = [t.strip() for t in topics_text.splitlines() if t.strip()]
         topics = topics[:20]
 
         if not topics:
-            st.error("Paste at least 1 topic.")
+            st.error("Add topics or click Auto-generate first.")
             st.stop()
 
-        # clear old outputs (optional)
-        # for f in VID_DIR.glob("reel_*.mp4"):
-        #     f.unlink(missing_ok=True)
+        # Remember them (prevents repeats next time)
+        remember_topics(topics)
 
         prog = st.progress(0)
         status = st.empty()
@@ -396,7 +507,6 @@ else:
 
             prog.progress(int(i / len(topics) * 100))
 
-        # zip everything
         zip_path = VID_DIR / "reels_batch.zip"
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
             for p in outputs:
@@ -410,12 +520,11 @@ else:
         st.success(f"Batch done: {len(outputs)}/{len(topics)} reels created.")
         st.download_button("Download ZIP (all MP4s)", open(zip_path, "rb"), zip_path.name, mime="application/zip")
 
-        # Preview first one
         if outputs:
             st.write("Preview (first reel):")
             st.video(str(outputs[0]))
 
-        if DEBUG and outputs:
+        if DEBUG:
             st.write("Saved files:")
             for p in outputs:
                 st.write(p.name)
