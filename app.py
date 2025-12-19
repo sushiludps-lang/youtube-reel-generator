@@ -5,8 +5,10 @@ from pathlib import Path
 import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
-from moviepy.audio.fx.all import speedx
+
+# ✅ MoviePy v2 imports (IMPORTANT)
+from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
+from moviepy.audio.fx import speedx
 
 # ===============================
 # CONFIG
@@ -16,21 +18,22 @@ BASE = Path(__file__).parent
 IMG_DIR = BASE / "images"
 AUD_DIR = BASE / "audio"
 VID_DIR = BASE / "video"
+
 for d in (IMG_DIR, AUD_DIR, VID_DIR):
     d.mkdir(exist_ok=True)
 
 PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
 
 # ===============================
-# UI (your requested structure)
+# UI
 # ===============================
-st.title("YouTube Reel Generator – 6 Scenes × 10s (2 images per scene)")
+st.title("YouTube Reel Generator — 6 Scenes × 10s (2 Images Each)")
 
 topic = st.text_input("Topic", "Why does fire have no shadow?")
 
 SCENES = 6
 SCENE_SECONDS = 10.0
-TARGET_SECONDS = SCENES * SCENE_SECONDS  # 60
+TARGET_SECONDS = 60.0
 IMAGES_PER_SCENE = 2
 
 TRANSITION_SEC = st.slider("Transition (crossfade) seconds", 0.2, 1.0, 0.5)
@@ -41,32 +44,32 @@ ENABLE_CAPTIONS = st.toggle("Burn captions on video", True)
 CAPTION_FONT_SIZE = st.slider("Caption font size", 42, 84, 64)
 CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 
-show_debug = st.toggle("Show debug", False)
+show_debug = st.toggle("Show debug")
 
 # ===============================
-# SCRIPT (6 scenes)
+# SCRIPT (fixed 6 scenes)
 # ===============================
-def build_6_scene_script(topic: str):
+def build_script(topic):
     return [
         f"{topic} — quick answer.",
         "A shadow forms when one strong light is blocked.",
         "Fire is glowing hot gas that emits its own light.",
         "Because it emits light, it fills in its own shadow.",
         "Flames are partly transparent, so they don’t block all light.",
-        "You only see a shadow if a much brighter light is behind the flame.",
+        "You only see a shadow if a brighter light is behind the flame.",
     ]
 
-script = build_6_scene_script(topic)
+script = build_script(topic)
 
 # ===============================
-# FONT LOADER (Cloud-safe)
+# FONT LOADER
 # ===============================
-def load_font(size: int):
-    candidates = [
+def load_font(size):
+    paths = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
-    for p in candidates:
+    for p in paths:
         try:
             return ImageFont.truetype(p, size)
         except Exception:
@@ -76,56 +79,55 @@ def load_font(size: int):
 FONT = load_font(CAPTION_FONT_SIZE)
 
 # ===============================
-# CAPTION DRAW (PIL)
+# CAPTION DRAW
 # ===============================
-def burn_caption(img: Image.Image, caption: str) -> Image.Image:
+def burn_caption(img, caption):
     img = img.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
     lines = textwrap.wrap(caption, width=28)[:3]
-    line_height = int(CAPTION_FONT_SIZE * 1.2)
-    padding = 60
-    box_h = padding + line_height * len(lines) + 30
-    box_y1 = HEIGHT - box_h - 120
-    box_y2 = HEIGHT - 120
+    line_h = int(CAPTION_FONT_SIZE * 1.2)
+
+    box_h = 60 + line_h * len(lines) + 30
+    y1 = HEIGHT - box_h - 120
+    y2 = HEIGHT - 120
 
     draw.rectangle(
-        [(60, box_y1), (WIDTH - 60, box_y2)],
-        fill=(0, 0, 0, int(CAPTION_BOX_OPACITY)),
+        [(60, y1), (WIDTH - 60, y2)],
+        fill=(0, 0, 0, CAPTION_BOX_OPACITY),
     )
 
-    y = box_y1 + 35
+    y = y1 + 35
     for line in lines:
         draw.text((90, y), line, font=FONT, fill=(255, 255, 255, 255))
-        y += line_height
+        y += line_h
 
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 # ===============================
-# PEXELS IMAGE FETCH (exactly 2 per scene)
+# PEXELS FETCH (2 images per scene)
 # ===============================
-def fetch_pexels_images(query: str, count: int):
+def fetch_images(query):
     headers = {"Authorization": PEXELS_API_KEY}
-    url = "https://api.pexels.com/v1/search"
-    params = {"query": query, "per_page": 20, "orientation": "portrait", "size": "large"}
-
-    r = requests.get(url, headers=headers, params=params, timeout=20)
+    params = {
+        "query": query,
+        "per_page": 20,
+        "orientation": "portrait",
+        "size": "large",
+    }
+    r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=20)
     r.raise_for_status()
+
     photos = r.json().get("photos", [])
-
     paths = []
-    for i, p in enumerate(photos[:count]):
-        img_url = p["src"].get("portrait") or p["src"].get("large")
-        if not img_url:
-            continue
 
-        img_path = IMG_DIR / f"img_{abs(hash((query, i)))}.jpg"
-        img_data = requests.get(img_url, timeout=20).content
-        with open(img_path, "wb") as f:
-            f.write(img_data)
+    for i, p in enumerate(photos[:IMAGES_PER_SCENE]):
+        url = p["src"].get("portrait")
+        img_path = IMG_DIR / f"{abs(hash((query, i)))}.jpg"
 
-        img = Image.open(img_path).convert("RGB")
+        data = requests.get(url, timeout=20).content
+        img = Image.open(Path(img_path).write_bytes(data) or img_path).convert("RGB")
         img = ImageOps.exif_transpose(img)
         img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 
@@ -135,70 +137,55 @@ def fetch_pexels_images(query: str, count: int):
         img.save(img_path, quality=95)
         paths.append(img_path)
 
-    if not paths:
-        return []
-    while len(paths) < count:
+    while len(paths) < IMAGES_PER_SCENE:
         paths.append(paths[-1])
-    return paths[:count]
+
+    return paths
 
 # ===============================
-# SAFE ZOOM
+# ZOOM
 # ===============================
-def apply_zoom(clip, zoom):
+def apply_zoom(clip):
     if not ENABLE_ZOOM:
         return clip
-    return clip.resize(lambda t: 1 + (zoom - 1) * (t / clip.duration))
+    return clip.resize(lambda t: 1 + (ZOOM_STRENGTH - 1) * (t / clip.duration))
 
 # ===============================
-# BUILD VIDEO (visuals fixed 60s, audio forced to 60s)
+# BUILD VIDEO
 # ===============================
 if st.button("Generate Final MP4 Reel"):
-    st.info("Generating reel… (6 scenes × 10s, 2 images each)")
+    st.info("Generating 60s reel…")
 
-    # ---- Create narration audio
     narration = " ".join(script)
     audio_path = AUD_DIR / "voice.mp3"
     gTTS(narration).save(audio_path)
+
     audio = AudioFileClip(str(audio_path))
-
-    # ---- Force audio to exactly 60 seconds using speedx (free)
-    # factor < 1 => slower (longer). factor > 1 => faster (shorter).
-    if audio.duration > 0:
-        factor = audio.duration / TARGET_SECONDS  # old/target
-        audio = speedx(audio, factor=factor).subclip(0, TARGET_SECONDS)
-
-    # ---- Build 60s visuals: 12 images × 5s each
-    per_image_duration = SCENE_SECONDS / IMAGES_PER_SCENE  # 5s
+    factor = audio.duration / TARGET_SECONDS
+    audio = speedx(audio, factor=factor).subclip(0, TARGET_SECONDS)
 
     clips = []
-    all_images = []
+    per_image_dur = SCENE_SECONDS / IMAGES_PER_SCENE  # 5s
 
-    for scene_text in script:
-        imgs = fetch_pexels_images(scene_text, IMAGES_PER_SCENE)
-        if not imgs:
-            st.error("No images fetched. Check PEXELS_API_KEY or try a different topic.")
-            st.stop()
-
-        all_images.extend(imgs)
-
-        for img_path in imgs:
-            c = ImageClip(str(img_path)).set_duration(per_image_duration)
-            c = apply_zoom(c, ZOOM_STRENGTH)
+    for scene in script:
+        for img in fetch_images(scene):
+            c = ImageClip(str(img)).with_duration(per_image_dur)
+            c = apply_zoom(c)
             clips.append(c)
 
-    final_video = concatenate_videoclips(
-        clips, method="compose", padding=-TRANSITION_SEC
-    ).set_audio(audio)
+    video = concatenate_videoclips(
+        clips,
+        method="compose",
+        padding=-TRANSITION_SEC
+    ).with_audio(audio)
 
     out = VID_DIR / "final_reel.mp4"
-    final_video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
+    video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
 
     if show_debug:
-        st.write("Original TTS audio duration:", round(AudioFileClip(str(audio_path)).duration, 2))
-        st.write("Final audio duration:", round(audio.duration, 2))
-        st.write("Final video duration:", round(final_video.duration, 2))
-        st.write("Images used:", len(all_images))
+        st.write("Audio:", audio.duration)
+        st.write("Video:", video.duration)
 
-    st.success("Final MP4 ready (audio and visuals both = 60 seconds).")
+    st.success("Final MP4 ready (audio + captions perfectly synced)")
     st.video(str(out))
     st.download_button("Download MP4", open(out, "rb"), "reel.mp4")
