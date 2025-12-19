@@ -7,6 +7,7 @@ import requests
 import streamlit as st
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # --- FIX for MoviePy on new Pillow (Image.ANTIALIAS removed) ---
@@ -40,20 +41,13 @@ VID_DIR.mkdir(exist_ok=True)
 # Page setup
 # -----------------------
 st.set_page_config(page_title="Reel Generator", layout="wide", page_icon="🎬")
-st.title("YouTube Reel Generator – MP4 Builder (More Images + Transitions)")
+st.title("YouTube Reel Generator – MP4 Builder (Free Images + Transitions)")
 
 # -----------------------
 # Secrets
 # -----------------------
 gemini_key = st.secrets.get("GEMINI_API_KEY", "")
-if not gemini_key:
-    st.error("Missing GEMINI_API_KEY in Secrets.")
-    st.stop()
-
 PEXELS_KEY = st.secrets.get("PEXELS_API_KEY", "")
-
-client = genai.Client(api_key=gemini_key)
-TEXT_MODEL = "gemini-2.5-flash"
 
 # -----------------------
 # UI inputs
@@ -69,7 +63,7 @@ enable_kenburns = st.toggle("Enable subtle zoom (Ken Burns)", value=True)
 kenburns_zoom = st.slider("Zoom strength", 1.00, 1.10, 1.04, 0.01)
 
 image_source = st.selectbox("Image source", ["Pexels (free key)", "Placeholders only"], index=0)
-show_debug = st.toggle("Show image debug", value=False)
+show_debug = st.toggle("Show debug (errors, URLs)", value=True)
 
 if image_source.startswith("Pexels") and not PEXELS_KEY:
     st.warning("PEXELS_API_KEY is missing. Add it in Streamlit Cloud → Manage app → Settings → Secrets.")
@@ -100,8 +94,8 @@ def make_placeholder_image(text: str, idx: int) -> Path:
     if line:
         lines.append(line)
 
-    y = 500
-    for ln in lines[:8]:
+    y = 520
+    for ln in lines[:9]:
         draw.text((80, y), ln, fill=(240, 240, 240), font=font)
         y += 90
 
@@ -117,7 +111,6 @@ def pexels_search_urls(query: str, k: int):
     headers = {"Authorization": PEXELS_KEY}
     params = {"query": query, "per_page": 80, "orientation": "portrait", "size": "large"}
     r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=25)
-
     if r.status_code != 200:
         return [], r.status_code, r.text[:500]
 
@@ -133,9 +126,6 @@ def pexels_search_urls(query: str, k: int):
             urls.append(src["portrait"])
         elif src.get("large"):
             urls.append(src["large"])
-
-    if not urls:
-        return [], 200, "No usable src URLs"
 
     urls = list(dict.fromkeys(urls))
     random.shuffle(urls)
@@ -169,17 +159,16 @@ def build_images_for_scene(scene_text: str, clip_start_idx: int, k: int):
     if image_source.startswith("Pexels"):
         urls, status, msg = pexels_search_urls(scene_text, k)
         if show_debug:
-            with st.expander(f"Pexels debug (clip {clip_start_idx})", expanded=False):
-                st.write({"status": status, "message": msg, "count": len(urls)})
-                for u in urls[:10]:
-                    st.write(u)
+            st.caption(f"Pexels: status={status} msg={msg} (scene '{scene_text[:40]}...')")
 
         for j, url in enumerate(urls, start=0):
             out = IMG_DIR / f"clip_{clip_start_idx + j}.png"
             try:
                 download_and_fit_9x16(url, out)
                 paths.append(out)
-            except Exception:
+            except Exception as e:
+                if show_debug:
+                    st.write("Image download error:", str(e))
                 continue
 
     while len(paths) < k:
@@ -191,17 +180,34 @@ def build_images_for_scene(scene_text: str, clip_start_idx: int, k: int):
 def ken_burns(clip: ImageClip, zoom=1.04):
     return clip.fx(vfx.resize, lambda t: 1 + (zoom - 1) * (t / clip.duration))
 
-# -----------------------
-# Generate everything
-# -----------------------
-if st.button("Generate Final MP4 Reel", type="primary"):
+def fallback_script(topic: str, n: int):
+    # Always valid JSON-like structure (no Gemini needed)
+    hook = f"{topic} — here’s the quick reason."
+    scenes = [
+        "A shadow forms when one strong, single light source is blocked.",
+        "Fire is not a solid object; it’s glowing hot gas that emits light.",
+        "Because the flame itself is a light source, it fills in its own shadow.",
+        "Also, flames are partially transparent, so they don’t block all light.",
+        "You can see a shadow only if a much brighter light is behind the flame.",
+        "That’s why candle flames rarely cast a clear shadow in normal rooms.",
+        "Try it: shine a phone flashlight behind a lighter and look on the wall."
+    ]
+    scenes = scenes[:max(5, min(n, len(scenes)))]
+    cta = "Follow for more 60-second science."
+    return {"hook": hook, "scenes": scenes, "cta": cta}
 
-    script_prompt = f"""
+def generate_script_with_gemini(topic: str, n: int, target_sec: int):
+    if not gemini_key:
+        return None, "Missing GEMINI_API_KEY"
+
+    client = genai.Client(api_key=gemini_key)
+
+    prompt = f"""
 Return ONLY valid JSON. No commentary. No markdown. No extra text.
 
 Topic: {topic}
-Total target length: ~{target_seconds} seconds of narration (aim 120–150 words max).
-Scenes: {num_scenes}
+Total target length: ~{target_sec} seconds of narration (aim 120–150 words max).
+Scenes: {n}
 
 Rules:
 - Hook: 1 sentence (<= 12 words)
@@ -216,19 +222,42 @@ Format EXACTLY:
 }}
 """.strip()
 
-    result = client.models.generate_content(
-        model=TEXT_MODEL,
-        contents=script_prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
+    # IMPORTANT: google.genai usually expects model names WITHOUT "models/"
+    model_candidates = ["gemini-2.5-flash", "models/gemini-2.5-flash"]
 
-    raw = (getattr(result, "text", "") or "").strip().replace("```json", "").replace("```", "").strip()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        st.error("Gemini did not return valid JSON. Raw output below:")
-        st.code(raw)
-        st.stop()
+    last_err = None
+    for m in model_candidates:
+        try:
+            resp = client.models.generate_content(
+                model=m,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            raw = (getattr(resp, "text", "") or "").strip().replace("```json", "").replace("```", "").strip()
+            data = json.loads(raw)
+            return data, None
+        except (ClientError, json.JSONDecodeError) as e:
+            last_err = f"Model {m} failed: {type(e).__name__}: {str(e)[:400]}"
+            continue
+        except Exception as e:
+            last_err = f"Model {m} failed: {type(e).__name__}: {str(e)[:400]}"
+            continue
+
+    return None, last_err or "Unknown Gemini error"
+
+# -----------------------
+# Generate MP4
+# -----------------------
+if st.button("Generate Final MP4 Reel", type="primary"):
+
+    with st.spinner("Generating script..."):
+        data, err = generate_script_with_gemini(topic, num_scenes, target_seconds)
+
+    if err:
+        st.warning("Gemini script generation failed. Using free fallback script.")
+        if show_debug:
+            st.code(err)
+        data = fallback_script(topic, num_scenes)
 
     scenes = data.get("scenes", [])
     if not isinstance(scenes, list) or not scenes:
@@ -238,50 +267,61 @@ Format EXACTLY:
     hook = data.get("hook", "")
     cta = data.get("cta", "")
 
+    st.subheader("Script")
+    st.write("**Hook:**", hook)
+    for i, s in enumerate(scenes, 1):
+        st.write(f"**Scene {i}:**", s)
+    st.write("**CTA:**", cta)
+
     narration_parts = [hook] + [str(s) for s in scenes] + [cta]
     narration = ". ".join([p.strip() for p in narration_parts if p and p.strip()]) + "."
 
-    audio_path = AUD_DIR / "voiceover.mp3"
-    gTTS(narration, lang="en", slow=False).save(str(audio_path))
-    st.audio(str(audio_path))
+    with st.spinner("Generating voiceover..."):
+        audio_path = AUD_DIR / "voiceover.mp3"
+        gTTS(narration, lang="en", slow=False).save(str(audio_path))
+        st.audio(str(audio_path))
 
     audio = AudioFileClip(str(audio_path))
 
-    all_image_paths = []
-    clip_idx = 1
-    for s in scenes:
-        paths = build_images_for_scene(str(s), clip_idx, imgs_per_scene)
-        all_image_paths.extend(paths)
-        clip_idx += imgs_per_scene
+    with st.spinner("Fetching images..."):
+        all_image_paths = []
+        clip_idx = 1
+        for s in scenes:
+            paths = build_images_for_scene(str(s), clip_idx, imgs_per_scene)
+            all_image_paths.extend(paths)
+            clip_idx += imgs_per_scene
 
     per_img = max(0.5, audio.duration / max(1, len(all_image_paths)))
 
-    clips = []
-    for idx, p in enumerate(all_image_paths):
-        if MOVIEPY_V2:
-            c = ImageClip(str(p), duration=per_img)
-        else:
-            c = ImageClip(str(p)).set_duration(per_img)
-
-        if enable_kenburns and kenburns_zoom > 1.0:
-            c = ken_burns(c, zoom=kenburns_zoom)
-
-        if transition_sec > 0 and idx > 0:
+    with st.spinner("Rendering video..."):
+        clips = []
+        for idx, p in enumerate(all_image_paths):
             if MOVIEPY_V2:
-                c = c.with_effects([vfx.CrossFadeIn(transition_sec)])
+                c = ImageClip(str(p), duration=per_img)
             else:
-                c = c.crossfadein(transition_sec)
+                c = ImageClip(str(p)).set_duration(per_img)
 
-        clips.append(c)
+            if enable_kenburns and kenburns_zoom > 1.0:
+                c = ken_burns(c, zoom=kenburns_zoom)
 
-    if MOVIEPY_V2:
-        video = concatenate_videoclips(clips, method="compose").with_audio(audio)
-    else:
-        video = concatenate_videoclips(clips, method="compose").set_audio(audio)
+            if transition_sec > 0 and idx > 0:
+                if MOVIEPY_V2:
+                    c = c.with_effects([vfx.CrossFadeIn(transition_sec)])
+                else:
+                    c = c.crossfadein(transition_sec)
 
-    out_video = VID_DIR / "final_reel.mp4"
-    video.write_videofile(str(out_video), fps=30, codec="libx264", audio_codec="aac")
+            clips.append(c)
 
-    st.success(f"Final MP4 ready • Images: {len(all_image_paths)} • Audio: {audio.duration:.1f}s • Per image: {per_img:.2f}s")
+        if MOVIEPY_V2:
+            video = concatenate_videoclips(clips, method="compose").with_audio(audio)
+        else:
+            video = concatenate_videoclips(clips, method="compose").set_audio(audio)
+
+        out_video = VID_DIR / "final_reel.mp4"
+        video.write_videofile(str(out_video), fps=30, codec="libx264", audio_codec="aac")
+
+    st.success(
+        f"Final MP4 ready • Images: {len(all_image_paths)} • Audio: {audio.duration:.1f}s • Per image: {per_img:.2f}s"
+    )
     st.video(str(out_video))
     st.download_button("Download MP4", data=open(out_video, "rb"), file_name="final_reel.mp4", mime="video/mp4")
