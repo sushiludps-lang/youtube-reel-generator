@@ -50,8 +50,13 @@ client = genai.Client(api_key=api_key)
 
 # Text model for script JSON
 TEXT_MODEL = "gemini-2.5-flash"
-# Image model for scene images
-IMAGE_MODEL = "gemini-2.5-flash-image"
+
+# Image models to try (in order). Your earlier model list included these names.
+IMAGE_MODELS_TO_TRY = [
+    "gemini-2.5-flash-image",
+    "gemini-2.5-flash-image-preview",
+    "gemini-2.0-flash-exp-image-generation",
+]
 
 # -----------------------
 # UI inputs
@@ -59,7 +64,7 @@ IMAGE_MODEL = "gemini-2.5-flash-image"
 topic = st.text_input("Enter a topic for the YouTube Reel", value="Why does fire have no shadow?")
 num_scenes = st.slider("Number of scenes", 5, 10, 7)
 
-use_ai_images = st.toggle("Use AI-generated images (recommended)", value=True)
+use_ai_images = st.toggle("Use AI-generated images (auto-fallback if blocked)", value=True)
 image_style = st.selectbox(
     "Image style",
     ["cinematic", "photorealistic", "minimal infographic", "3D render", "anime"],
@@ -102,10 +107,29 @@ def make_placeholder_image(text: str, idx: int) -> Path:
     img.save(out)
     return out
 
+def _extract_first_image_bytes(resp) -> bytes | None:
+    try:
+        parts = resp.candidates[0].content.parts
+    except Exception:
+        return None
+
+    for part in parts:
+        inline = getattr(part, "inline_data", None) or getattr(part, "inlineData", None)
+        if not inline:
+            continue
+        data = getattr(inline, "data", None)
+        if not data:
+            continue
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        if isinstance(data, str):
+            return base64.b64decode(data)
+    return None
+
 def generate_ai_image(scene_text: str, idx: int) -> Path | None:
     """
-    Calls Gemini image model and saves the first returned image to images/scene_{idx}.png
-    Returns Path if successful, else None.
+    Tries multiple Gemini image models. If any call fails (ClientError/permissions),
+    return None so we fall back to placeholder.
     """
     prompt = (
         f"Create a single vertical 9:16 image for a YouTube Shorts reel.\n"
@@ -114,38 +138,36 @@ def generate_ai_image(scene_text: str, idx: int) -> Path | None:
         f"Do not add any text overlays or subtitles."
     )
 
-    resp = client.models.generate_content(
-        model=IMAGE_MODEL,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            image_config=types.ImageConfig(aspect_ratio="9:16")
-        ),
-    )
+    last_err = None
 
-    # Extract inline image data
-    try:
-        parts = resp.candidates[0].content.parts
-    except Exception:
-        return None
+    for model_name in IMAGE_MODELS_TO_TRY:
+        try:
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    image_config=types.ImageConfig(aspect_ratio="9:16")
+                ),
+            )
+            img_bytes = _extract_first_image_bytes(resp)
+            if img_bytes:
+                out = IMG_DIR / f"scene_{idx}.png"
+                out.write_bytes(img_bytes)
+                return out
+        except Exception as e:
+            # Covers google.genai.errors.ClientError and other transient issues
+            last_err = e
+            continue
 
-    image_bytes = None
-    for part in parts:
-        inline = getattr(part, "inline_data", None) or getattr(part, "inlineData", None)
-        if inline:
-            data = getattr(inline, "data", None)
-            if data:
-                if isinstance(data, (bytes, bytearray)):
-                    image_bytes = bytes(data)
-                elif isinstance(data, str):
-                    image_bytes = base64.b64decode(data)
-                break
+    # Show one warning per run (not per scene) if image gen is blocked
+    if last_err is not None and "ai_image_warned" not in st.session_state:
+        st.session_state["ai_image_warned"] = True
+        st.warning(
+            "AI image generation failed (likely model access/permissions/quota on Cloud). "
+            "Falling back to placeholder images so the MP4 can still be created."
+        )
 
-    if not image_bytes:
-        return None
-
-    out = IMG_DIR / f"scene_{idx}.png"
-    out.write_bytes(image_bytes)
-    return out
+    return None
 
 # -----------------------
 # Generate everything
@@ -176,14 +198,12 @@ Format EXACTLY:
     )
 
     raw = (getattr(result, "text", "") or "").strip()
-
     if not raw:
         st.error("Gemini returned empty output.")
         st.stop()
 
     raw = raw.replace("```json", "").replace("```", "").strip()
 
-    # ---- Robust JSON parse (and show raw if it fails)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
