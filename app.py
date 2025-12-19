@@ -5,7 +5,18 @@ import streamlit as st
 import google.generativeai as genai
 from PIL import Image, ImageDraw, ImageFont
 from gtts import gTTS
-from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
+
+# -------------------------------------------------
+# MoviePy import (Cloud + Local compatible)
+# -------------------------------------------------
+try:
+    # MoviePy v2 (local / newer)
+    from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
+    MOVIEPY_V2 = True
+except ImportError:
+    # MoviePy v1 (Streamlit Cloud)
+    from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
+    MOVIEPY_V2 = False
 
 # -----------------------
 # Paths
@@ -41,7 +52,7 @@ topic = st.text_input(
 num_scenes = st.slider("Number of scenes", 5, 10, 7)
 
 # -----------------------
-# Placeholder image generator
+# Placeholder image
 # -----------------------
 def make_placeholder_image(text: str, idx: int) -> Path:
     img = Image.new("RGB", (1080, 1920), (15, 15, 20))
@@ -75,7 +86,7 @@ def make_placeholder_image(text: str, idx: int) -> Path:
     return out
 
 # -----------------------
-# Generate pipeline
+# Generate everything
 # -----------------------
 if st.button("Generate Final MP4 Reel", type="primary"):
 
@@ -114,7 +125,7 @@ Format EXACTLY:
             st.code(raw)
             st.stop()
 
-    # ---- Display + build assets
+    # ---- Display + assets
     st.subheader("Hook")
     st.success(data["hook"])
 
@@ -141,13 +152,16 @@ Format EXACTLY:
     st.subheader("Voiceover Preview")
     st.audio(str(audio_path))
 
-    # ---- Video render (MoviePy v2 SAFE)
+    # ---- Video render
     audio = AudioFileClip(str(audio_path))
     per_image = max(0.8, audio.duration / len(images))
 
-    clips = [ImageClip(str(img), duration=per_image) for img in images]
-
-    video = concatenate_videoclips(clips, method="compose").with_audio(audio)
+    if MOVIEPY_V2:
+        clips = [ImageClip(str(img), duration=per_image) for img in images]
+        video = concatenate_videoclips(clips, method="compose").with_audio(audio)
+    else:
+        clips = [ImageClip(str(img)).set_duration(per_image) for img in images]
+        video = concatenate_videoclips(clips, method="compose").set_audio(audio)
 
     out_video = VID_DIR / "final_reel.mp4"
     video.write_videofile(
