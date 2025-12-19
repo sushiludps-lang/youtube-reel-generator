@@ -1,7 +1,7 @@
 streamlit
-google-genai
+moviepy
 pillow
 gtts
-moviepy
-imageio-ffmpeg
 requests
+imageio-ffmpeg
+numpy
