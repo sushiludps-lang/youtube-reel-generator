@@ -1,7 +1,8 @@
 import json
-import base64
+import random
 from pathlib import Path
 
+import requests
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -34,26 +35,20 @@ VID_DIR.mkdir(exist_ok=True)
 # Page setup
 # -----------------------
 st.set_page_config(page_title="Reel Generator", layout="wide", page_icon="🎬")
-st.title("YouTube Reel Generator – Full MP4 Builder (AI Images)")
+st.title("YouTube Reel Generator – Full MP4 Builder (FREE Images)")
 
 # -----------------------
 # Secrets + GenAI client
 # -----------------------
-api_key = st.secrets.get("GEMINI_API_KEY", "")
-if not api_key:
-    st.error("Missing GEMINI_API_KEY. Add it in Streamlit Cloud → Manage app → Settings → Secrets.")
+gemini_key = st.secrets.get("GEMINI_API_KEY", "")
+if not gemini_key:
+    st.error("Missing GEMINI_API_KEY in Secrets.")
     st.stop()
 
-client = genai.Client(api_key=api_key)
-
+client = genai.Client(api_key=gemini_key)
 TEXT_MODEL = "gemini-2.5-flash"
 
-# Try multiple image models (your earlier model list included these)
-IMAGE_MODELS_TO_TRY = [
-    "gemini-2.5-flash-image",
-    "gemini-2.5-flash-image-preview",
-    "gemini-2.0-flash-exp-image-generation",
-]
+PEXELS_KEY = st.secrets.get("PEXELS_API_KEY", "")
 
 # -----------------------
 # UI inputs
@@ -61,14 +56,7 @@ IMAGE_MODELS_TO_TRY = [
 topic = st.text_input("Enter a topic for the YouTube Reel", value="Why does fire have no shadow?")
 num_scenes = st.slider("Number of scenes", 5, 10, 7)
 
-use_ai_images = st.toggle("Use AI-generated images", value=True)
-show_image_debug = st.toggle("Show AI image debug (recommended)", value=True)
-
-image_style = st.selectbox(
-    "Image style",
-    ["cinematic", "photorealistic", "minimal infographic", "3D render", "anime"],
-    index=0
-)
+image_source = st.selectbox("Image source", ["Pexels (free key)", "Placeholders only"], index=0)
 
 # -----------------------
 # Helpers
@@ -83,7 +71,6 @@ def make_placeholder_image(text: str, idx: int) -> Path:
     img = Image.new("RGB", (1080, 1920), (15, 15, 20))
     draw = ImageDraw.Draw(img)
     font = _load_font(64)
-
     draw.text((80, 120), f"Scene {idx}", fill=(200, 200, 200), font=font)
 
     words = text.split()
@@ -106,75 +93,73 @@ def make_placeholder_image(text: str, idx: int) -> Path:
     img.save(out)
     return out
 
-def _extract_first_image_bytes(resp) -> bytes | None:
-    try:
-        parts = resp.candidates[0].content.parts
-    except Exception:
+def pexels_search_image(query: str) -> str | None:
+    """Return a single portrait-ish image URL from Pexels."""
+    if not PEXELS_KEY:
         return None
 
-    for part in parts:
-        inline = getattr(part, "inline_data", None) or getattr(part, "inlineData", None)
-        if not inline:
-            continue
-        data = getattr(inline, "data", None)
-        if not data:
-            continue
-        if isinstance(data, (bytes, bytearray)):
-            return bytes(data)
-        if isinstance(data, str):
-            return base64.b64decode(data)
-    return None
+    headers = {"Authorization": PEXELS_KEY}
+    params = {"query": query, "per_page": 15}
+    r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=20)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    photos = data.get("photos", [])
+    if not photos:
+        return None
 
-def try_generate_ai_image(scene_text: str, idx: int):
-    """
-    Returns (img_path_or_none, debug_lines)
-    """
-    prompt = (
-        f"Create a single vertical 9:16 image for a YouTube Shorts reel.\n"
-        f"Style: {image_style}.\n"
-        f"Scene: {scene_text}\n"
-        f"Do not add any text overlays or subtitles."
-    )
+    # Prefer portrait src if available
+    choices = []
+    for p in photos:
+        src = p.get("src", {})
+        if src.get("portrait"):
+            choices.append(src["portrait"])
+        elif src.get("large"):
+            choices.append(src["large"])
 
-    debug = []
-    for model_name in IMAGE_MODELS_TO_TRY:
-        try:
-            debug.append(f"Trying model: {model_name}")
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=[prompt],
-                config=types.GenerateContentConfig(
-                    image_config=types.ImageConfig(aspect_ratio="9:16")
-                ),
-            )
-            img_bytes = _extract_first_image_bytes(resp)
-            if img_bytes:
-                out = IMG_DIR / f"scene_{idx}.png"
-                out.write_bytes(img_bytes)
-                debug.append(f"✅ Image bytes received ({len(img_bytes)} bytes)")
-                return out, debug
-            else:
-                debug.append("❌ No image bytes returned (response had no inline image data)")
-        except Exception as e:
-            debug.append(f"❌ Error: {type(e).__name__}: {e}")
+    return random.choice(choices) if choices else None
 
-    return None, debug
+def download_and_fit_9x16(img_url: str, out_path: Path):
+    """Download image, center-crop to 9:16, resize to 1080x1920."""
+    r = requests.get(img_url, timeout=30)
+    r.raise_for_status()
+    img = Image.open(Path(out_path.parent) / "tmp_img").convert("RGB")  # dummy to satisfy type check
 
-# -----------------------
-# QUICK TEST BUTTON
-# -----------------------
-st.divider()
-if st.button("Test AI image generation"):
-    test_scene = "A cinematic close-up of a candle flame in a dark room, soft glow, realistic lighting."
-    img, debug = try_generate_ai_image(test_scene, 999)
-    st.subheader("AI Image Test Result")
-    if img:
-        st.success("AI image generation worked.")
-        st.image(str(img), use_container_width=True)
+    from io import BytesIO
+    img = Image.open(BytesIO(r.content)).convert("RGB")
+
+    target_w, target_h = 1080, 1920
+    target_ratio = target_w / target_h
+
+    w, h = img.size
+    src_ratio = w / h
+
+    if src_ratio > target_ratio:
+        # too wide -> crop width
+        new_w = int(h * target_ratio)
+        left = (w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, h))
     else:
-        st.error("AI image generation FAILED. See debug below (this is the reason you only get placeholders).")
-    st.code("\n".join(debug))
-st.divider()
+        # too tall -> crop height
+        new_h = int(w / target_ratio)
+        top = (h - new_h) // 2
+        img = img.crop((0, top, w, top + new_h))
+
+    img = img.resize((target_w, target_h))
+    img.save(out_path)
+
+def build_image_for_scene(scene_text: str, idx: int) -> Path:
+    """Use Pexels if available else placeholder."""
+    if image_source.startswith("Pexels"):
+        url = pexels_search_image(scene_text)
+        if url:
+            out = IMG_DIR / f"scene_{idx}.png"
+            try:
+                download_and_fit_9x16(url, out)
+                return out
+            except Exception:
+                pass
+    return make_placeholder_image(scene_text, idx)
 
 # -----------------------
 # Generate everything
@@ -195,7 +180,7 @@ Format EXACTLY:
 }}
 """.strip()
 
-    # Force JSON
+    # Force JSON output
     result = client.models.generate_content(
         model=TEXT_MODEL,
         contents=script_prompt,
@@ -216,57 +201,44 @@ Format EXACTLY:
         st.code(raw)
         st.stop()
 
-    st.subheader("Hook")
-    st.success(data.get("hook", ""))
-
     scenes = data.get("scenes", [])
-    cta = data.get("cta", "")
-
-    if not isinstance(scenes, list) or len(scenes) == 0:
+    if not isinstance(scenes, list) or not scenes:
         st.error("No scenes returned; cannot build video.")
         st.stop()
+
+    st.subheader("Hook")
+    st.success(data.get("hook", ""))
 
     images = []
     narration_parts = [data.get("hook", "")]
 
     st.subheader("Scenes")
     progress = st.progress(0)
-
     for i, scene in enumerate(scenes, start=1):
         scene_text = str(scene)
         narration_parts.append(scene_text)
 
-        img_path = None
-        debug_lines = []
-
-        if use_ai_images:
-            img_path, debug_lines = try_generate_ai_image(scene_text, i)
-
-        if not img_path:
-            img_path = make_placeholder_image(scene_text, i)
-
+        img_path = build_image_for_scene(scene_text, i)
         images.append(img_path)
 
         st.write(f"**Scene {i}:** {scene_text}")
         st.image(str(img_path), use_container_width=True)
-
-        if show_image_debug and use_ai_images:
-            with st.expander(f"AI image debug (Scene {i})"):
-                st.code("\n".join(debug_lines) if debug_lines else "No debug output.")
-
         progress.progress(i / len(scenes))
 
+    cta = data.get("cta", "")
     st.subheader("CTA")
     st.info(cta)
     narration_parts.append(cta)
 
     narration = ". ".join([p.strip() for p in narration_parts if p and p.strip()]) + "."
 
+    # Voiceover
     audio_path = AUD_DIR / "voiceover.mp3"
     gTTS(narration, lang="en", slow=False).save(str(audio_path))
     st.subheader("Voiceover Preview")
     st.audio(str(audio_path))
 
+    # Video render
     audio = AudioFileClip(str(audio_path))
     per_image = max(0.8, audio.duration / len(images))
 
