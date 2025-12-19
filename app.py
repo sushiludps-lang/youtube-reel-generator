@@ -6,10 +6,20 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+# Patch for MoviePy+Pillow: Image.ANTIALIAS removed in new Pillow
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
 # MoviePy v2 imports
 from moviepy import ImageClip, AudioFileClip, concatenate_videoclips, CompositeAudioClip
 from moviepy.audio.AudioClip import AudioArrayClip
 import numpy as np
+
+# Try to import vfx (MoviePy v2 effects)
+try:
+    from moviepy import vfx
+except Exception:
+    vfx = None
 
 # ===============================
 # CONFIG
@@ -88,8 +98,10 @@ def burn_caption(img, caption, font):
     y1 = HEIGHT - box_h - 120
     y2 = HEIGHT - 120
 
-    draw.rectangle([(60, y1), (WIDTH - 60, y2)],
-                   fill=(0, 0, 0, int(CAPTION_BOX_OPACITY)))
+    draw.rectangle(
+        [(60, y1), (WIDTH - 60, y2)],
+        fill=(0, 0, 0, int(CAPTION_BOX_OPACITY)),
+    )
 
     y = y1 + 35
     for line in lines:
@@ -103,12 +115,7 @@ def burn_caption(img, caption, font):
 # ===============================
 def fetch_images(scene_text, font):
     headers = {"Authorization": PEXELS_API_KEY}
-    params = {
-        "query": scene_text,
-        "per_page": 30,
-        "orientation": "portrait",
-        "size": "large",
-    }
+    params = {"query": scene_text, "per_page": 30, "orientation": "portrait", "size": "large"}
     r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=20)
     r.raise_for_status()
     photos = r.json().get("photos", [])
@@ -134,25 +141,40 @@ def fetch_images(scene_text, font):
 
     if not paths:
         return []
-
     while len(paths) < IMAGES_PER_SCENE:
         paths.append(paths[-1])
-
     return paths[:IMAGES_PER_SCENE]
 
 # ===============================
-# ZOOM
+# ZOOM (MoviePy v2-safe)
 # ===============================
 def apply_zoom(clip):
-    if not ENABLE_ZOOM:
+    if not ENABLE_ZOOM or ZOOM_STRENGTH <= 1.0:
         return clip
-    return clip.resize(lambda t: 1 + (ZOOM_STRENGTH - 1) * (t / clip.duration))
+
+    # Preferred: MoviePy v2 effects API
+    if vfx is not None and hasattr(clip, "with_effects") and hasattr(vfx, "Resize"):
+        try:
+            return clip.with_effects([
+                vfx.Resize(lambda t: 1 + (ZOOM_STRENGTH - 1) * (t / clip.duration))
+            ])
+        except Exception:
+            return clip
+
+    # Fallback: older API if available
+    if hasattr(clip, "resize"):
+        try:
+            return clip.resize(lambda t: 1 + (ZOOM_STRENGTH - 1) * (t / clip.duration))
+        except Exception:
+            return clip
+
+    # If neither exists, just return unchanged (no crash)
+    return clip
 
 # ===============================
-# AUDIO FIT: pad with silence to 60s (no speedx, no concatenate/subclip)
+# AUDIO FIT: pad with silence to 60s
 # ===============================
 def fit_audio_to_60s(narration_audio: AudioFileClip, target_seconds: float) -> CompositeAudioClip:
-    # 60s silence base
     sr = 44100
     silence = np.zeros((int(sr * target_seconds), 2), dtype=np.float32)
     bed = AudioArrayClip(silence, fps=sr)
@@ -161,13 +183,9 @@ def fit_audio_to_60s(narration_audio: AudioFileClip, target_seconds: float) -> C
     if narration_audio.duration > target_seconds:
         if hasattr(narration_audio, "subclip"):
             narration_audio = narration_audio.subclip(0, target_seconds)
-        elif hasattr(narration_audio, "subclipped"):
-            narration_audio = narration_audio.subclipped(0, target_seconds)
 
-    # Overlay narration on silence bed
     mixed = CompositeAudioClip([bed, narration_audio])
 
-    # Force duration to target (MoviePy v2 uses with_duration)
     if hasattr(mixed, "with_duration"):
         mixed = mixed.with_duration(target_seconds)
     else:
@@ -189,7 +207,7 @@ if st.button("Generate Final MP4 Reel"):
     audio = fit_audio_to_60s(narration_audio, TARGET_SECONDS)
 
     # Visuals: 6 scenes × 2 images = 12 images, 5s each
-    per_image_dur = SCENE_SECONDS / IMAGES_PER_SCENE  # 5 seconds
+    per_image_dur = SCENE_SECONDS / IMAGES_PER_SCENE  # 5s
 
     font = load_font(CAPTION_FONT_SIZE)
     clips = []
@@ -209,7 +227,6 @@ if st.button("Generate Final MP4 Reel"):
 
     video = concatenate_videoclips(clips, method="compose", padding=-TRANSITION_SEC)
 
-    # MoviePy v2: prefer with_audio
     if hasattr(video, "with_audio"):
         video = video.with_audio(audio)
     else:
@@ -224,6 +241,6 @@ if st.button("Generate Final MP4 Reel"):
         st.write("Final video duration:", round(video.duration, 2))
         st.write("Images used:", used_images)
 
-    st.success("Done (audio padded to 60s, captions aligned to 6×10s timeline).")
+    st.success("Done.")
     st.video(str(out))
     st.download_button("Download MP4", open(out, "rb"), "reel.mp4", mime="video/mp4")
