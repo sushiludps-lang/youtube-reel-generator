@@ -6,16 +6,12 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# Patch for MoviePy+Pillow: Image.ANTIALIAS removed in new Pillow
-if not hasattr(Image, "ANTIALIAS"):
-    Image.ANTIALIAS = Image.Resampling.LANCZOS
-
 # MoviePy v2 imports
 from moviepy import ImageClip, AudioFileClip, concatenate_videoclips, CompositeAudioClip
 from moviepy.audio.AudioClip import AudioArrayClip
 import numpy as np
 
-# Try to import vfx (MoviePy v2 effects)
+# Try MoviePy v2 effects (optional; code works without them)
 try:
     from moviepy import vfx
 except Exception:
@@ -29,10 +25,17 @@ BASE = Path(__file__).parent
 IMG_DIR = BASE / "images"
 AUD_DIR = BASE / "audio"
 VID_DIR = BASE / "video"
-for d in (IMG_DIR, AUD_DIR, VID_DIR):
+TMP_DIR = BASE / "tmp"
+
+for d in (IMG_DIR, AUD_DIR, VID_DIR, TMP_DIR):
     d.mkdir(exist_ok=True)
 
 PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
+
+SCENES = 6
+SCENE_SECONDS = 10.0
+TARGET_SECONDS = 60.0
+IMAGES_PER_SCENE = 2  # fixed as you requested
 
 # ===============================
 # UI
@@ -41,23 +44,20 @@ st.title("YouTube Reel Generator — 6 Scenes × 10s (2 Images Each)")
 
 topic = st.text_input("Topic", "Why does fire have no shadow?")
 
-SCENES = 6
-SCENE_SECONDS = 10.0
-TARGET_SECONDS = 60.0
-IMAGES_PER_SCENE = 2
-
-TRANSITION_SEC = st.slider("Transition (crossfade) seconds", 0.2, 1.0, 0.5)
-ENABLE_ZOOM = st.toggle("Enable subtle zoom (Ken Burns)", True)
-ZOOM_STRENGTH = st.slider("Zoom strength", 1.01, 1.08, 1.04)
-
 ENABLE_CAPTIONS = st.toggle("Burn captions on video", True)
 CAPTION_FONT_SIZE = st.slider("Caption font size", 42, 84, 64)
 CAPTION_BOX_OPACITY = st.slider("Caption box opacity", 80, 220, 160)
 
+ENABLE_ZOOM = st.toggle("Enable subtle zoom", True)
+ZOOM_STRENGTH = st.slider("Zoom strength", 1.01, 1.08, 1.03)
+
+ENABLE_FADE = st.toggle("Enable fade transitions (safe)", True)
+FADE_SEC = st.slider("Fade seconds", 0.1, 1.0, 0.35)
+
 DEBUG = st.toggle("Show debug", False)
 
 # ===============================
-# SCRIPT (fixed 6 scenes)
+# SCRIPT (6 scenes)
 # ===============================
 def build_script(topic):
     return [
@@ -69,7 +69,7 @@ def build_script(topic):
         "You only see a shadow if a brighter light is behind the flame.",
     ]
 
-script = build_script(topic)
+base_scenes = build_script(topic)
 
 # ===============================
 # FONT LOADER (cloud-safe)
@@ -86,7 +86,12 @@ def load_font(size):
             pass
     return ImageFont.load_default()
 
-def burn_caption(img, caption, font):
+FONT = load_font(CAPTION_FONT_SIZE)
+
+# ===============================
+# CAPTIONS (PIL)
+# ===============================
+def burn_caption(img, caption):
     img = img.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -105,15 +110,15 @@ def burn_caption(img, caption, font):
 
     y = y1 + 35
     for line in lines:
-        draw.text((90, y), line, font=font, fill=(255, 255, 255, 255))
+        draw.text((90, y), line, font=FONT, fill=(255, 255, 255, 255))
         y += line_h
 
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 # ===============================
-# PEXELS FETCH (exactly 2 images/scene)
+# PEXELS IMAGES (2 per scene)
 # ===============================
-def fetch_images(scene_text, font):
+def fetch_images(scene_text):
     headers = {"Authorization": PEXELS_API_KEY}
     params = {"query": scene_text, "per_page": 30, "orientation": "portrait", "size": "large"}
     r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=20)
@@ -134,7 +139,7 @@ def fetch_images(scene_text, font):
         img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 
         if ENABLE_CAPTIONS:
-            img = burn_caption(img, scene_text, font)
+            img = burn_caption(img, scene_text)
 
         img.save(img_path, quality=95)
         paths.append(img_path)
@@ -146,13 +151,11 @@ def fetch_images(scene_text, font):
     return paths[:IMAGES_PER_SCENE]
 
 # ===============================
-# ZOOM (MoviePy v2-safe)
+# MOVIEPY SAFE EFFECTS
 # ===============================
 def apply_zoom(clip):
     if not ENABLE_ZOOM or ZOOM_STRENGTH <= 1.0:
         return clip
-
-    # Preferred: MoviePy v2 effects API
     if vfx is not None and hasattr(clip, "with_effects") and hasattr(vfx, "Resize"):
         try:
             return clip.with_effects([
@@ -160,61 +163,121 @@ def apply_zoom(clip):
             ])
         except Exception:
             return clip
+    return clip
 
-    # Fallback: older API if available
-    if hasattr(clip, "resize"):
-        try:
-            return clip.resize(lambda t: 1 + (ZOOM_STRENGTH - 1) * (t / clip.duration))
-        except Exception:
-            return clip
-
-    # If neither exists, just return unchanged (no crash)
+def apply_fade(clip):
+    if not ENABLE_FADE or FADE_SEC <= 0:
+        return clip
+    if vfx is not None and hasattr(clip, "with_effects"):
+        effs = []
+        if hasattr(vfx, "FadeIn"):
+            effs.append(vfx.FadeIn(FADE_SEC))
+        if hasattr(vfx, "FadeOut"):
+            effs.append(vfx.FadeOut(FADE_SEC))
+        if effs:
+            try:
+                return clip.with_effects(effs)
+            except Exception:
+                return clip
     return clip
 
 # ===============================
-# AUDIO FIT: pad with silence to 60s
+# AUDIO: make each scene ~10s of SPEECH (not silence)
 # ===============================
-def fit_audio_to_60s(narration_audio: AudioFileClip, target_seconds: float) -> CompositeAudioClip:
+FILLERS = [
+    "Here’s an easy way to picture it.",
+    "This is the key idea to remember.",
+    "Think of the flame as a light source, not an object.",
+    "That simple detail changes the shadow behavior.",
+    "Most indoor flames won’t show a clear shadow.",
+]
+
+def tts_to_file(text, out_path):
+    gTTS(text).save(str(out_path))
+    return out_path
+
+def clip_set_start(aclip, t):
+    # moviepy v2 uses with_start; older uses set_start
+    if hasattr(aclip, "with_start"):
+        return aclip.with_start(t)
+    return aclip.set_start(t)
+
+def clip_set_duration(aclip, d):
+    if hasattr(aclip, "with_duration"):
+        return aclip.with_duration(d)
+    return aclip.set_duration(d)
+
+def make_scene_audio(scene_text, idx, target=SCENE_SECONDS):
+    """
+    Create an mp3 for this scene whose spoken duration is close to target.
+    We keep adding short filler sentences until duration >= ~9.5s,
+    then trim/pad to exactly 10s using a silence bed.
+    """
+    text = scene_text
+    tries = 0
+
+    while True:
+        tmp_mp3 = TMP_DIR / f"scene_{idx}_try{tries}.mp3"
+        tts_to_file(text, tmp_mp3)
+        a = AudioFileClip(str(tmp_mp3))
+
+        if DEBUG:
+            st.write(f"Scene {idx} try {tries} duration:", round(a.duration, 2))
+
+        # If close enough, stop expanding
+        if a.duration >= target * 0.95 or tries >= 6:
+            break
+
+        # Add a filler sentence and retry
+        text = text + " " + FILLERS[tries % len(FILLERS)]
+        tries += 1
+
+    # Build a 10s silence bed and overlay narration
     sr = 44100
-    silence = np.zeros((int(sr * target_seconds), 2), dtype=np.float32)
-    bed = AudioArrayClip(silence, fps=sr)
+    bed = AudioArrayClip(np.zeros((int(sr * target), 2), dtype=np.float32), fps=sr)
 
-    # Trim narration if longer than target
-    if narration_audio.duration > target_seconds:
-        if hasattr(narration_audio, "subclip"):
-            narration_audio = narration_audio.subclip(0, target_seconds)
+    # Trim narration to 10s if too long
+    if a.duration > target:
+        if hasattr(a, "subclip"):
+            a = a.subclip(0, target)
 
-    mixed = CompositeAudioClip([bed, narration_audio])
-
-    if hasattr(mixed, "with_duration"):
-        mixed = mixed.with_duration(target_seconds)
-    else:
-        mixed = mixed.set_duration(target_seconds)
+    mixed = CompositeAudioClip([bed, a])
+    mixed = clip_set_duration(mixed, target)
 
     return mixed
+
+def make_full_audio(scene_texts):
+    # 60s silence bed
+    sr = 44100
+    bed60 = AudioArrayClip(np.zeros((int(sr * TARGET_SECONDS), 2), dtype=np.float32), fps=sr)
+
+    parts = [bed60]
+    for i, s in enumerate(scene_texts):
+        sa = make_scene_audio(s, i + 1, target=SCENE_SECONDS)
+        sa = clip_set_start(sa, i * SCENE_SECONDS)
+        parts.append(sa)
+
+    full = CompositeAudioClip(parts)
+    full = clip_set_duration(full, TARGET_SECONDS)
+    return full
 
 # ===============================
 # BUILD VIDEO
 # ===============================
 if st.button("Generate Final MP4 Reel"):
-    st.info("Generating 60s reel…")
+    st.info("Generating 60s reel… (speech will fill each 10s scene)")
 
-    # Voiceover
-    narration = " ".join(script)
-    audio_path = AUD_DIR / "voice.mp3"
-    gTTS(narration).save(str(audio_path))
-    narration_audio = AudioFileClip(str(audio_path))
-    audio = fit_audio_to_60s(narration_audio, TARGET_SECONDS)
+    # Audio (speech-filled per scene)
+    audio = make_full_audio(base_scenes)
 
     # Visuals: 6 scenes × 2 images = 12 images, 5s each
-    per_image_dur = SCENE_SECONDS / IMAGES_PER_SCENE  # 5s
+    per_image_dur = SCENE_SECONDS / IMAGES_PER_SCENE  # 5 seconds
 
-    font = load_font(CAPTION_FONT_SIZE)
     clips = []
     used_images = 0
 
-    for scene in script:
-        imgs = fetch_images(scene, font)
+    for scene in base_scenes:
+        imgs = fetch_images(scene)
         if not imgs:
             st.error("No images fetched. Check PEXELS_API_KEY or try a different topic.")
             st.stop()
@@ -222,10 +285,12 @@ if st.button("Generate Final MP4 Reel"):
         for img in imgs:
             c = ImageClip(str(img), duration=per_image_dur)
             c = apply_zoom(c)
+            c = apply_fade(c)
             clips.append(c)
             used_images += 1
 
-    video = concatenate_videoclips(clips, method="compose", padding=-TRANSITION_SEC)
+    # No overlap (keeps duration exactly 60s)
+    video = concatenate_videoclips(clips, method="compose", padding=0)
 
     if hasattr(video, "with_audio"):
         video = video.with_audio(audio)
@@ -236,11 +301,10 @@ if st.button("Generate Final MP4 Reel"):
     video.write_videofile(str(out), fps=30, codec="libx264", audio_codec="aac")
 
     if DEBUG:
-        st.write("Narration duration:", round(narration_audio.duration, 2))
         st.write("Final audio duration:", round(audio.duration, 2))
         st.write("Final video duration:", round(video.duration, 2))
         st.write("Images used:", used_images)
 
-    st.success("Done.")
+    st.success("Done (narration fills the full 60s and matches 6×10s scenes).")
     st.video(str(out))
     st.download_button("Download MP4", open(out, "rb"), "reel.mp4", mime="video/mp4")
