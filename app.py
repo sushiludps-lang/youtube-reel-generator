@@ -1,231 +1,247 @@
-import json, time, re, os, zipfile
+import json
+import os
+import time
+import re
 from pathlib import Path
+from typing import List
+
+import streamlit as st
 import requests
 import numpy as np
-import streamlit as st
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# FFmpeg fix
+# ---- MoviePy (Cloud-safe) ----
+from moviepy.editor import (
+    ImageClip,
+    AudioFileClip,
+    CompositeVideoClip,
+    concatenate_videoclips,
+    concatenate_audioclips,
+    AudioClip,
+    vfx,
+)
+
+# ---- FFmpeg fix (Streamlit Cloud) ----
 try:
     import imageio_ffmpeg
     os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     pass
 
-from moviepy.editor import (
-    ImageClip, AudioFileClip, CompositeVideoClip,
-    concatenate_videoclips, concatenate_audioclips, AudioClip
-)
-
+# ---- Gemini ----
 from google import genai
 from google.genai import types
 
-# ================= CONFIG =================
+# ===============================
+# CONFIG
+# ===============================
 W, H = 1080, 1920
 FPS = 30
 SCENE_SECONDS = 10
 IMAGES_PER_SCENE = 2
 IMG_SECONDS = SCENE_SECONDS / IMAGES_PER_SCENE
-CROSSFADE = 0.7
+CROSSFADE = 0.6
 AUDIO_FPS = 44100
 
-CAPTION_SCALE = 2.5  # 🔥 BIGGER TEXT HERE
+FONT_SIZE = 80  # BIG subtitles
+SUB_MARGIN = 160
 
+# ===============================
+# PATHS
+# ===============================
 BASE = Path(__file__).parent
-IMG = BASE / "images"
-AUD = BASE / "audio"
-VID = BASE / "video"
-for d in (IMG, AUD, VID):
+IMG_DIR = BASE / "images"
+AUD_DIR = BASE / "audio"
+VID_DIR = BASE / "video"
+CACHE = BASE / "cache"
+
+for d in (IMG_DIR, AUD_DIR, VID_DIR, CACHE):
     d.mkdir(exist_ok=True)
 
-# ================= SECRETS =================
-client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+# ===============================
+# SECRETS
+# ===============================
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
+
+client = genai.Client(api_key=GEMINI_API_KEY)
 TEXT_MODEL = "models/gemini-2.5-flash"
 
-# ================= HELPERS =================
-def slug(t):
-    return re.sub(r"[^a-z0-9]+", "_", t.lower())[:60] or "reel"
+# ===============================
+# HELPERS
+# ===============================
+def slug(t: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", t.lower())[:60]
 
-def pexels(q):
+def silence(duration: float):
+    return AudioClip(lambda t: np.zeros((1,), dtype=np.float32),
+                     duration=duration, fps=AUDIO_FPS)
+
+def fit_audio(audio, duration):
+    if audio.duration > duration:
+        return audio.subclip(0, duration)
+    if audio.duration < duration:
+        return concatenate_audioclips([audio, silence(duration - audio.duration)])
+    return audio
+
+def pexels_images(query: str, n: int):
     r = requests.get(
         "https://api.pexels.com/v1/search",
         headers={"Authorization": PEXELS_API_KEY},
-        params={"query": q, "orientation": "portrait", "per_page": 15},
-        timeout=25,
+        params={"query": query, "per_page": n, "orientation": "portrait"},
+        timeout=20,
     )
+    r.raise_for_status()
     return r.json().get("photos", [])
 
-def download_img(url, out):
-    out.write_bytes(requests.get(url, timeout=25).content)
-    img = Image.open(out).convert("RGB")
-    img = ImageOps.exif_transpose(img)
+def prepare_image(url: str, out: Path):
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    img = Image.open(BytesIO(r.content)).convert("RGB")
     img = ImageOps.fit(img, (W, H))
-    img.save(out, quality=92)
+    img.save(out, quality=90)
 
-def placeholder(out, text):
-    img = Image.new("RGB", (W, H), (25, 25, 30))
+def subtitle_clip(text: str, duration: float):
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    f = ImageFont.load_default()
-    d.text((60, 80), "PLACEHOLDER", fill="white", font=f)
-    d.text((60, 150), text[:200], fill="white", font=f)
-    img.save(out, quality=92)
 
-# ================= HUGE SUBTITLES =================
-def subtitle_png(text, out):
-    scale = CAPTION_SCALE
-    bigW, bigH = int(W * scale), int(H * scale)
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            FONT_SIZE,
+        )
+    except:
+        font = ImageFont.load_default()
 
-    img = Image.new("RGBA", (bigW, bigH), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    font = ImageFont.load_default()
+    bbox = d.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
 
-    words = text.split()
-    lines, cur = [], []
-    for w in words:
-        if len(" ".join(cur + [w])) <= 24:
-            cur.append(w)
-        else:
-            lines.append(" ".join(cur))
-            cur = [w]
-    if cur:
-        lines.append(" ".join(cur))
-    lines = lines[:2]
+    x = (W - tw) // 2
+    y = H - SUB_MARGIN - th
 
-    boxes = [d.textbbox((0, 0), l, font=font) for l in lines]
-    widths = [b[2] - b[0] for b in boxes]
-    heights = [b[3] - b[1] for b in boxes]
+    d.rectangle(
+        (x - 40, y - 30, x + tw + 40, y + th + 30),
+        fill=(0, 0, 0, 180),
+    )
+    d.text((x, y), text, font=font, fill=(255, 255, 255, 255))
 
-    text_w = max(widths)
-    text_h = sum(heights) + 40
-    pad_x, pad_y = 120, 80
+    path = IMG_DIR / f"sub_{time.time_ns()}.png"
+    img.save(path)
 
-    box_w = text_w + 2 * pad_x
-    box_h = text_h + 2 * pad_y
+    return ImageClip(str(path)).set_duration(duration)
 
-    x1 = (bigW - box_w) // 2
-    y2 = bigH - int(360 * scale)
-    y1 = y2 - box_h
-
-    d.rounded_rectangle((x1, y1, x1 + box_w, y2), 60, fill=(0, 0, 0, 200))
-
-    y = y1 + pad_y
-    for i, l in enumerate(lines):
-        lx = (bigW - widths[i]) // 2
-        d.text((lx, y), l, fill="white", font=font)
-        y += heights[i] + 40
-
-    img = img.resize((W, H), Image.LANCZOS)
-    img.save(out)
-
-def silence(d):
-    return AudioClip(lambda t: np.zeros((1,), dtype=np.float32), duration=d, fps=AUDIO_FPS)
-
-def fit_audio(a, d):
-    if a.duration > d:
-        return a.subclip(0, d)
-    if a.duration < d:
-        return concatenate_audioclips([a, silence(d - a.duration)])
-    return a
-
-# ================= GEMINI =================
-def gen_topics(n):
+# ===============================
+# GEMINI
+# ===============================
+def generate_topics(n: int):
+    prompt = f"""
+Return JSON only.
+Generate {n} unique science curiosity YouTube Shorts topics.
+Format:
+{{"topics": ["..."]}}
+"""
     r = client.models.generate_content(
         model=TEXT_MODEL,
-        contents=f'Return JSON only: {{"topics":[...]}}. Generate {n} science curiosity questions.',
+        contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
     return json.loads(r.text)["topics"]
 
-def gen_script(topic, scenes):
+def generate_script(topic: str, scenes: int):
+    prompt = f"""
+Return JSON only.
+
+Topic: "{topic}"
+Create exactly {scenes} scenes.
+Each scene spoken for ~10 seconds.
+
+Format:
+{{
+ "scenes":[
+   {{"subtitle":"...", "image_query":"..."}}
+ ]
+}}
+"""
     r = client.models.generate_content(
         model=TEXT_MODEL,
-        contents=f'''
-Return JSON only.
-Exactly {scenes} scenes.
-Each scene ~10 seconds.
-
-{{"scenes":[{{"subtitle":"...","query":"..."}}]}}
-
-Topic: {topic}
-''',
+        contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
-    return json.loads(r.text)["scenes"]
+    return json.loads(r.text)
 
-# ================= BUILD =================
-def build_reel(topic, scenes, idx):
-    auds, vids = [], []
+# ===============================
+# BUILD REEL
+# ===============================
+def build_reel(topic: str, script: dict, index: int):
+    clips = []
+    audios = []
 
-    for i, s in enumerate(scenes, 1):
-        photos = pexels(s["query"])
-        pair = []
+    for i, sc in enumerate(script["scenes"], 1):
+        photos = pexels_images(sc["image_query"], IMAGES_PER_SCENE)
+        imgs = []
 
-        for j in range(2):
-            out = IMG / f"{idx}_{i}_{j}.jpg"
-            try:
-                download_img(photos[j]["src"]["portrait"], out)
-            except Exception:
-                placeholder(out, topic)
-            pair.append(out)
+        for j in range(IMAGES_PER_SCENE):
+            out = IMG_DIR / f"{slug(topic)}_{index}_{i}_{j}.jpg"
+            if j < len(photos):
+                prepare_image(photos[j]["src"]["portrait"], out)
+            else:
+                Image.new("RGB", (W, H), (30, 30, 30)).save(out)
+            imgs.append(out)
 
-        mp3 = AUD / f"{idx}_{i}.mp3"
-        gTTS(s["subtitle"]).save(str(mp3))
+        c1 = ImageClip(str(imgs[0])).set_duration(IMG_SECONDS)
+        c2 = ImageClip(str(imgs[1])).set_duration(IMG_SECONDS).crossfadein(CROSSFADE)
+        scene = concatenate_videoclips([c1, c2], method="compose", padding=-CROSSFADE)
+        scene = scene.fx(vfx.resize, 1.02)
 
-        # ✅ FIXED LINE (Path → str)
+        # audio
+        mp3 = AUD_DIR / f"{slug(topic)}_{index}_{i}.mp3"
+        gTTS(sc["subtitle"]).save(str(mp3))
         a = fit_audio(AudioFileClip(str(mp3)), SCENE_SECONDS)
-        auds.append(a)
 
-        c1 = ImageClip(str(pair[0])).set_duration(IMG_SECONDS)
-        c2 = ImageClip(str(pair[1])).set_duration(IMG_SECONDS).crossfadein(CROSSFADE)
-        base = concatenate_videoclips([c1, c2], padding=-CROSSFADE)
+        sub = subtitle_clip(sc["subtitle"], SCENE_SECONDS)
+        final_scene = CompositeVideoClip([scene, sub]).set_audio(a)
 
-        sub = IMG / f"{idx}_{i}_sub.png"
-        subtitle_png(s["subtitle"], sub)
-        subclip = ImageClip(str(sub)).set_duration(SCENE_SECONDS)
+        clips.append(final_scene)
+        audios.append(a)
 
-        vids.append(CompositeVideoClip([base, subclip]).set_audio(a))
-
-    final = concatenate_videoclips(vids, padding=-CROSSFADE)
-    final = final.set_audio(concatenate_audioclips(auds))
-
-    out = VID / f"{idx}_{slug(topic)}.mp4"
-    final.write_videofile(
+    video = concatenate_videoclips(clips, method="compose", padding=-CROSSFADE)
+    out = VID_DIR / f"{slug(topic)}_{index}.mp4"
+    video.write_videofile(
         str(out),
         fps=FPS,
         codec="libx264",
         audio_codec="aac",
         preset="ultrafast",
+        threads=2,
         logger=None,
     )
     return out
 
-# ================= UI =================
+# ===============================
+# UI
+# ===============================
 st.set_page_config("Reel Factory", layout="wide")
-st.title("🎬 Reel Factory — BIG Subtitles (Fixed)")
+st.title("🎬 Reel Factory (Stable)")
 
-scenes_n = st.selectbox("Scenes per reel (10s each)", [6, 8])
-reels_n = st.number_input("Reels to generate", 1, 20, 1)
+num_reels = st.slider("How many reels to generate?", 1, 20, 1)
 
 if st.button("Generate Topics"):
-    st.session_state.topics = gen_topics(20)
+    st.session_state["topics"] = generate_topics(num_reels)
 
-if "topics" in st.session_state:
-    topics = st.session_state.topics[:reels_n]
+topics = st.session_state.get("topics", [])
 
-    if st.button("Build"):
-        vids = []
-        for i, t in enumerate(topics, 1):
-            scenes = gen_script(t, scenes_n)
-            vids.append(build_reel(t, scenes, i))
+if topics:
+    selected = st.multiselect("Select reels to build", topics, default=topics[:1])
 
-        if len(vids) == 1:
-            st.video(str(vids[0]))
-            st.download_button("Download MP4", open(vids[0], "rb"), vids[0].name)
-        else:
-            zip_path = VID / "batch.zip"
-            with zipfile.ZipFile(zip_path, "w") as z:
-                for v in vids:
-                    z.write(v, v.name)
-            st.download_button("Download ALL", open(zip_path, "rb"), "reels.zip")
+    if st.button("Build Selected Reels"):
+        for i, t in enumerate(selected, 1):
+            st.write(f"🎞️ Building: {t}")
+            script = generate_script(t, 6)
+            out = build_reel(t, script, i)
+            st.video(str(out))
+            st.download_button(
+                f"⬇️ Download {t}",
+                open(out, "rb"),
+                file_name=out.name,
+            )
