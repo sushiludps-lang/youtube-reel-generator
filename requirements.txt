@@ -1,8 +1,8 @@
 streamlit
 google-genai
 requests
+gtts
 pillow
-gTTS
 numpy
-imageio-ffmpeg
 moviepy==1.0.3
+imageio-ffmpeg
