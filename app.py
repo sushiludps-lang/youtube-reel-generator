@@ -26,7 +26,6 @@ from moviepy.editor import (
     concatenate_videoclips,
     concatenate_audioclips,
     AudioClip,
-    vfx,
 )
 
 # Gemini
@@ -39,7 +38,7 @@ FPS = 30
 SCENE_SECONDS = 10
 IMAGES_PER_SCENE = 2
 IMG_SECONDS = SCENE_SECONDS / IMAGES_PER_SCENE
-CROSSFADE = 0.6
+CROSSFADE = 0.7  # smooth
 AUDIO_FPS = 44100
 
 BASE = Path(__file__).parent
@@ -65,7 +64,7 @@ def pexels(q: str):
     r = requests.get(
         "https://api.pexels.com/v1/search",
         headers={"Authorization": PEXELS_API_KEY},
-        params={"query": q, "orientation": "portrait", "per_page": 10},
+        params={"query": q, "orientation": "portrait", "per_page": 15},
         timeout=25,
     )
     r.raise_for_status()
@@ -77,6 +76,7 @@ def download_img(url: str, out: Path):
     out.write_bytes(r.content)
     img = Image.open(out).convert("RGB")
     img = ImageOps.exif_transpose(img)
+    # force exactly 1080x1920 (no black bars)
     img = ImageOps.fit(img, (W, H))
     img.save(out, quality=92)
 
@@ -89,18 +89,15 @@ def placeholder(out: Path, text: str):
     img.save(out, quality=92)
 
 def subtitle_png(text: str, out: Path):
-    # simple robust subtitles (works everywhere)
+    # robust subtitles overlay layer
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     f = ImageFont.load_default()
-    text = (text or "").strip()
-    if not text:
-        text = "..."
+    text = (text or "").strip() or "..."
     bbox = d.textbbox((0, 0), text, font=f)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     x = (W - tw) // 2
-    y = H - 220
-
+    y = H - 230
     pad_x, pad_y = 30, 18
     d.rectangle((x - pad_x, y - pad_y, x + tw + pad_x, y + th + pad_y), fill=(0, 0, 0, 180))
     d.text((x, y), text, fill=(255, 255, 255, 255), font=f)
@@ -156,6 +153,7 @@ Format:
     scenes_list = scenes_list[:scenes]
     while len(scenes_list) < scenes:
         scenes_list.append({"subtitle": "Here is the key idea in simple terms.", "query": topic})
+
     cleaned = []
     for s in scenes_list:
         sub = (s.get("subtitle") or "").strip() or "Here is the key idea in simple terms."
@@ -169,6 +167,7 @@ def build_reel(topic: str, scenes: list, idx: int, cb):
     def prog(p, m):
         cb(p, m, int(time.time() - start))
 
+    # 1) Images
     prog(0.05, "Fetching images")
     all_imgs = []
     for i, s in enumerate(scenes, 1):
@@ -191,32 +190,36 @@ def build_reel(topic: str, scenes: list, idx: int, cb):
                 placeholder(out, f"{topic} / scene {i}")
             pair.append(out)
         all_imgs.append(pair)
-
         prog(0.05 + 0.25 * (i / len(scenes)), f"Images {i}/{len(scenes)}")
 
+    # 2) Audio (each scene forced to 10s)
     prog(0.35, "Generating voiceover")
     aud_clips = []
     for i, s in enumerate(scenes, 1):
         mp3 = AUD / f"{idx:02d}_scene_{i:02d}.mp3"
         gTTS(s["subtitle"]).save(str(mp3))
-
-        # IMPORTANT: MoviePy needs a string path here
         a = AudioFileClip(str(mp3))
-        a2 = fit_audio(a, SCENE_SECONDS)
-        aud_clips.append(a2)
-
+        aud_clips.append(fit_audio(a, SCENE_SECONDS))
         prog(0.35 + 0.20 * (i / len(scenes)), f"Audio {i}/{len(scenes)}")
 
-    full_audio = concatenate_audioclips(aud_clips).set_duration(len(scenes) * SCENE_SECONDS)
+    total_seconds = len(scenes) * SCENE_SECONDS
+    full_audio = concatenate_audioclips(aud_clips).set_duration(total_seconds)
 
+    # 3) Video clips per scene
     prog(0.60, "Building video")
     scene_clips = []
     for i, (pair, s) in enumerate(zip(all_imgs, scenes), 1):
-        c1 = ImageClip(str(pair[0])).set_duration(IMG_SECONDS).fx(vfx.resize, 1.03)
-        c2 = ImageClip(str(pair[1])).set_duration(IMG_SECONDS).fx(vfx.resize, 1.03).crossfadein(CROSSFADE)
+        # image 1 + image 2 with crossfade (NO resize to avoid Pillow ANTIALIAS bug)
+        c1 = ImageClip(str(pair[0])).set_duration(IMG_SECONDS)
+        c2 = ImageClip(str(pair[1])).set_duration(IMG_SECONDS).crossfadein(CROSSFADE)
 
-        base = concatenate_videoclips([c1, c2], method="compose", padding=-CROSSFADE).set_duration(SCENE_SECONDS)
+        base = concatenate_videoclips(
+            [c1, c2],
+            method="compose",
+            padding=-CROSSFADE
+        ).set_duration(SCENE_SECONDS)
 
+        # subtitles overlay for full 10s
         sub = IMG / f"{idx:02d}_sub_{i:02d}.png"
         subtitle_png(s["subtitle"], sub)
         subclip = ImageClip(str(sub)).set_duration(SCENE_SECONDS)
@@ -232,8 +235,9 @@ def build_reel(topic: str, scenes: list, idx: int, cb):
         scene_clips[k] = scene_clips[k].crossfadein(CROSSFADE)
 
     final = concatenate_videoclips(scene_clips, method="compose", padding=-CROSSFADE)
-    final = final.set_audio(full_audio).set_duration(len(scenes) * SCENE_SECONDS)
+    final = final.set_audio(full_audio).set_duration(total_seconds)
 
+    # 4) Export
     prog(0.90, "Exporting MP4")
     out = VID / f"{idx:02d}_{slug(topic)}.mp4"
     final.write_videofile(
@@ -256,7 +260,7 @@ def build_reel(topic: str, scenes: list, idx: int, cb):
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="Reel Factory", layout="wide")
-st.title("Reel Factory — Gemini Script + Pexels Images + Subtitles + Smooth Transitions")
+st.title("Reel Factory — Gemini Script + Pexels Images + Subtitles + Smooth Crossfade")
 
 scenes_n = st.selectbox("Scenes per reel (each 10s)", [6, 8], index=0)
 reels_n = st.number_input("How many reels to generate now?", min_value=1, max_value=20, value=1, step=1)
