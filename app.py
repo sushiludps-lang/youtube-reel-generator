@@ -1,3 +1,249 @@
+import json, time, re, os, zipfile
+from pathlib import Path
+from typing import List
+import requests
+import numpy as np
+import streamlit as st
+from gtts import gTTS
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+# FFmpeg fix (Streamlit Cloud)
+try:
+    import imageio_ffmpeg
+    os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    pass
+
+from moviepy.editor import (
+    ImageClip, AudioFileClip, CompositeVideoClip,
+    concatenate_videoclips, concatenate_audioclips, AudioClip
+)
+
+from google import genai
+from google.genai import types
+
+# ---------------- VIDEO CONFIG ----------------
+W, H = 1080, 1920
+FPS = 30
+SCENE_SECONDS = 10
+IMAGES_PER_SCENE = 2
+IMG_SECONDS = SCENE_SECONDS / IMAGES_PER_SCENE
+CROSSFADE = 0.7
+AUDIO_FPS = 44100
+
+# BIG subtitles
+FONT_SIZE = 90
+SUB_MARGIN_BOTTOM = 240
+BOX_PAD_X = 60
+BOX_PAD_Y = 40
+
+BASE = Path(__file__).parent
+IMG = BASE / "images"
+AUD = BASE / "audio"
+VID = BASE / "video"
+for d in (IMG, AUD, VID): d.mkdir(exist_ok=True)
+
+# ---------------- SECRETS ----------------
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+PEXELS_API_KEY = st.secrets["PEXELS_API_KEY"]
+client = genai.Client(api_key=GEMINI_API_KEY)
+TEXT_MODEL = "models/gemini-2.5-flash"
+
+# ---------------- HELPERS ----------------
+def slug(t):
+    return re.sub(r"[^a-z0-9]+", "_", t.lower())[:60] or "reel"
+
+def pexels(q):
+    r = requests.get(
+        "https://api.pexels.com/v1/search",
+        headers={"Authorization": PEXELS_API_KEY},
+        params={"query": q, "orientation": "portrait", "per_page": 15},
+        timeout=25,
+    )
+    r.raise_for_status()
+    return r.json().get("photos", [])
+
+def download_img(url, out):
+    out.write_bytes(requests.get(url, timeout=25).content)
+    img = Image.open(out).convert("RGB")
+    img = ImageOps.exif_transpose(img)
+    img = ImageOps.fit(img, (W, H))
+    img.save(out, quality=92)
+
+def placeholder(out, text):
+    img = Image.new("RGB", (W, H), (20, 20, 20))
+    d = ImageDraw.Draw(img)
+    f = ImageFont.load_default()
+    d.text((50, 80), "PLACEHOLDER", fill="white", font=f)
+    d.text((50, 160), text[:200], fill="white", font=f)
+    img.save(out, quality=92)
+
+def load_font(size):
+    for p in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "DejaVuSans-Bold.ttf",
+    ]:
+        try:
+            return ImageFont.truetype(p, size)
+        except:
+            pass
+    return ImageFont.load_default()
+
+FONT = load_font(FONT_SIZE)
+
+def subtitle_png(text, out):
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    words = text.split()
+    lines, cur = [], []
+    for w in words:
+        if len(" ".join(cur + [w])) <= 26:
+            cur.append(w)
+        else:
+            lines.append(" ".join(cur))
+            cur = [w]
+    if cur:
+        lines.append(" ".join(cur))
+    lines = lines[:2]
+
+    widths, heights = [], []
+    for l in lines:
+        box = d.textbbox((0, 0), l, font=FONT)
+        widths.append(box[2] - box[0])
+        heights.append(box[3] - box[1])
+
+    text_w = max(widths)
+    text_h = sum(heights) + 15 * (len(lines) - 1)
+
+    box_w = text_w + 2 * BOX_PAD_X
+    box_h = text_h + 2 * BOX_PAD_Y
+
+    x1 = (W - box_w) // 2
+    y2 = H - SUB_MARGIN_BOTTOM
+    y1 = y2 - box_h
+
+    d.rounded_rectangle((x1, y1, x1 + box_w, y2), 40, fill=(0, 0, 0, 200))
+
+    y = y1 + BOX_PAD_Y
+    for i, l in enumerate(lines):
+        lx = (W - widths[i]) // 2
+        d.text((lx, y), l, fill="white", font=FONT)
+        y += heights[i] + 15
+
+    img.save(out)
+
+def silence(d):
+    return AudioClip(lambda t: np.zeros((1,), dtype=np.float32), duration=d, fps=AUDIO_FPS)
+
+def fit_audio(a, d):
+    if a.duration > d: return a.subclip(0, d)
+    if a.duration < d: return concatenate_audioclips([a, silence(d - a.duration)])
+    return a
+
+# ---------------- GEMINI ----------------
+def gen_topics(n):
+    r = client.models.generate_content(
+        model=TEXT_MODEL,
+        contents=f'Return JSON only: {{"topics":[...]}}. Generate {n} science curiosity questions.',
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    return json.loads(r.text)["topics"]
+
+def gen_script(topic, scenes):
+    r = client.models.generate_content(
+        model=TEXT_MODEL,
+        contents=f'''
+Return JSON only.
+Exactly {scenes} scenes.
+Each scene ~10 seconds.
+
+{{"scenes":[{{"subtitle":"...","query":"..."}}]}}
+
+Topic: {topic}
+''',
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    return json.loads(r.text)["scenes"]
+
+# ---------------- BUILD ----------------
+def build_reel(topic, scenes, idx, cb):
+    auds, vids = [], []
+    total = len(scenes)
+
+    for i, s in enumerate(scenes, 1):
+        cb(i / total * 0.3, f"Images {i}/{total}", 0)
+        photos = pexels(s["query"])
+        pair = []
+        for j in range(2):
+            out = IMG / f"{idx}_{i}_{j}.jpg"
+            try:
+                download_img(photos[j]["src"]["portrait"], out)
+            except:
+                placeholder(out, topic)
+            pair.append(out)
+
+        mp3 = AUD / f"{idx}_{i}.mp3"
+        gTTS(s["subtitle"]).save(mp3)
+        a = fit_audio(AudioFileClip(mp3), SCENE_SECONDS)
+        auds.append(a)
+
+        c1 = ImageClip(str(pair[0])).set_duration(IMG_SECONDS)
+        c2 = ImageClip(str(pair[1])).set_duration(IMG_SECONDS).crossfadein(CROSSFADE)
+        base = concatenate_videoclips([c1, c2], padding=-CROSSFADE)
+
+        sub = IMG / f"{idx}_{i}_sub.png"
+        subtitle_png(s["subtitle"], sub)
+        subclip = ImageClip(str(sub)).set_duration(SCENE_SECONDS)
+
+        vids.append(
+            CompositeVideoClip([base, subclip]).set_audio(a)
+        )
+
+    final = concatenate_videoclips(vids, padding=-CROSSFADE)
+    final = final.set_audio(concatenate_audioclips(auds))
+
+    out = VID / f"{idx}_{slug(topic)}.mp4"
+    final.write_videofile(
+        str(out),
+        fps=FPS,
+        codec="libx264",
+        audio_codec="aac",
+        preset="ultrafast",
+        logger=None,
+    )
+    return out
+
+# ---------------- UI ----------------
+st.set_page_config("Reel Factory", layout="wide")
+st.title("🎬 Reel Factory")
+
+scenes_n = st.selectbox("Scenes per reel (10s each)", [6, 8])
+reels_n = st.number_input("Reels to generate", 1, 20, 1)
+
+if st.button("Generate Topics"):
+    st.session_state.topics = gen_topics(20)
+
+if "topics" in st.session_state:
+    topics = st.session_state.topics[:reels_n]
+    if st.button("Build"):
+        vids = []
+        p = st.progress(0)
+        s = st.empty()
+
+        for i, t in enumerate(topics, 1):
+            s.write(f"Building {t}")
+            scenes = gen_script(t, scenes_n)
+            vids.append(build_reel(t, scenes, i, lambda p_,m,e: p.progress(int(p_*100))))
+
+        if len(vids) == 1:
+            st.video(str(vids[0]))
+            st.download_button("Download MP4", open(vids[0], "rb"), vids[0].name)
+        else:
+            z = VID / "batch.zip"
+            with zipfile.ZipFile(z, "w") as zipf:
+                for v in vids: zipf.write(v, v.name)
+            st.download_button("Download ALL", open(z, "rb"), "reels.zip")
 import json, time, re
 from pathlib import Path
 from typing import List
@@ -325,3 +571,4 @@ with col2:
                     for out in built:
                         z.write(out, arcname=out.name)
                 st.download_button("Download ALL (ZIP)", data=open(zip_path, "rb"), file_name="batch_reels.zip", mime="application/zip")
+
