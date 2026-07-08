@@ -1,0 +1,66 @@
+{
+  "reels": {
+    "why does my voice sound weird on recordings?": {
+      "topic": "Why does my voice sound weird on recordings?",
+      "scenes": [
+        {
+          "subtitle": "Have you ever recorded your own voice and wondered, \"Is that really what I sound like to everyone else?\" It's a common mystery.",
+          "image_query": "Person listening headphones"
+        },
+        {
+          "subtitle": "When you speak, you hear your own voice through two pathways: air vibrations and vibrations through your skull bones.",
+          "image_query": "Skull ear diagram"
+        },
+        {
+          "subtitle": "Bone conduction makes your voice sound deeper and richer to you because it transmits lower frequencies more efficiently.",
+          "image_query": "Vibrating bone ear"
+        },
+        {
+          "subtitle": "Recordings only capture the sound waves traveling through the air, exactly as others hear your voice externally.",
+          "image_query": "Microphone sound waves"
+        },
+        {
+          "subtitle": "This absence of bone-conducted frequencies on a recording makes your voice sound higher-pitched and less full to your own ears.",
+          "image_query": "Man surprised sound"
+        },
+        {
+          "subtitle": "So, your recorded voice is actually how everyone else hears you! Give this video a like and follow for more interesting facts!",
+          "image_query": "Thumbs up follow button"
+        }
+      ],
+      "video_path": "/workspaces/youtube-reel-generator/video/reel01_why_does_my_voice_sound_weird_on_recordings_1783519521.mp4",
+      "updated_at": 1783519999
+    },
+    "does your brain actually create its own sense of time?": {
+      "topic": "Does your brain actually create its own sense of time?",
+      "scenes": [
+        {
+          "subtitle": "The clock on the wall doesn't dictate your sense of time. Your brain actively constructs its very own, unique perception of how moments unfold.",
+          "image_query": "clock face brain gears"
+        },
+        {
+          "subtitle": "It's all thanks to specialized neural networks and brain regions that act like internal 'pacemakers.' They don't just count seconds, but interpret experiences.",
+          "image_query": "brain synapses neural network"
+        },
+        {
+          "subtitle": "When your attention is focused or emotions are strong, your brain processes more information. This 'data density' makes time feel like it's rushing by.",
+          "image_query": "hourglass sand motion blur"
+        },
+        {
+          "subtitle": "When bored or waiting, your brain receives less new information. This 'data flow' reduction makes your internal clock stretch, making moments feel incredibly slow.",
+          "image_query": "clock melting slow motion"
+        },
+        {
+          "subtitle": "Your memories also influence time. Novel experiences create more distinct memories, making a past period feel longer when you look back on it.",
+          "image_query": "photo album memory collage"
+        },
+        {
+          "subtitle": "Yes, your brain absolutely sculpts its own subjective sense of time. To make life feel longer, embrace new experiences! Follow for more fascinating insights!",
+          "image_query": "brain lightbulb clock"
+        }
+      ],
+      "video_path": "/workspaces/youtube-reel-generator/video/reel01_does_your_brain_actually_create_its_own_sense_of_time_1783536695.mp4",
+      "updated_at": 1783537303
+    }
+  }
+}

@@ -27,7 +27,7 @@ from google.genai import types
 
 # -------------------- CONFIG --------------------
 W, H = 1080, 1920
-FPS = 30
+FPS = 24  # 24 is fine for still images with slow zoom; 20% fewer frames to encode
 IMAGES_PER_SCENE = 2
 CROSSFADE = 0.5
 MIN_SCENE_SECONDS = 4.0        # floor so a very short line doesn't flash by
@@ -54,8 +54,22 @@ TOPIC_HISTORY = CACHE / "topics_history.json"
 REELS_DB = CACHE / "reels_db.json"
 
 # -------------------- KEYS --------------------
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-PEXELS_KEY = st.secrets["PEXELS_API_KEY"]
+def get_secret(name: str) -> str:
+    """Read from .streamlit/secrets.toml, fall back to environment variable."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        val = os.environ.get(name)
+        if not val:
+            st.error(
+                f"Missing {name}. Create .streamlit/secrets.toml with your keys "
+                f"(see README instructions) or set it as an environment variable."
+            )
+            st.stop()
+        return val
+
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+PEXELS_KEY = get_secret("PEXELS_API_KEY")
 client = genai.Client(api_key=GEMINI_API_KEY)
 TEXT_MODEL = "models/gemini-2.5-flash"
 
@@ -98,16 +112,37 @@ def get_font(size: int = FONT_SIZE):
 FONT = get_font()
 
 # -------------------- TTS --------------------
+def _run_coro_in_own_thread(coro):
+    """Run an async coroutine on a dedicated thread with its own event loop.
+    Never touches Streamlit's event loop (asyncio.run here crashes the server)."""
+    import threading
+
+    error = []
+
+    def runner():
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(coro)
+        except Exception as e:
+            error.append(e)
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join()
+    if error:
+        raise error[0]
+
 def tts_save(text: str, out_path: Path):
     """Neural voice via edge-tts; gTTS as fallback."""
     text = (text or "").strip() or "..."
     try:
         import edge_tts
 
-        async def _run():
-            await edge_tts.Communicate(text, EDGE_VOICE, rate=EDGE_RATE).save(str(out_path))
-
-        asyncio.run(_run())
+        _run_coro_in_own_thread(
+            edge_tts.Communicate(text, EDGE_VOICE, rate=EDGE_RATE).save(str(out_path))
+        )
         if out_path.exists() and out_path.stat().st_size > 1000:
             return
     except Exception:
@@ -116,7 +151,7 @@ def tts_save(text: str, out_path: Path):
     gTTS(text).save(str(out_path))
 
 # -------------------- SUBTITLES --------------------
-def wrap_by_pixels(text: str, font, max_w: int, max_lines: int = 3) -> List[str]:
+def wrap_by_pixels(text: str, font, max_w: int) -> List[str]:
     words = (text or "").split()
     lines, cur = [], []
     for w in words:
@@ -128,24 +163,33 @@ def wrap_by_pixels(text: str, font, max_w: int, max_lines: int = 3) -> List[str]
             cur = [w]
     if cur:
         lines.append(" ".join(cur))
-    if len(lines) > max_lines:
-        # merge overflow into the last allowed line rather than dropping words
-        lines = lines[: max_lines - 1] + [" ".join(lines[max_lines - 1 :])]
     return lines or [""]
+
+def fit_text(text: str, max_w: int, max_lines: int = 4, start_size: int = FONT_SIZE, min_size: int = 34):
+    """Shrink the font until every line fits horizontally and the line count fits vertically."""
+    size = start_size
+    while size >= min_size:
+        font = get_font(size)
+        lines = wrap_by_pixels(text, font, max_w)
+        if len(lines) <= max_lines and all(font.getlength(l) <= max_w for l in lines):
+            return font, lines, size
+        size -= 4
+    font = get_font(min_size)
+    return font, wrap_by_pixels(text, font, max_w)[:max_lines], min_size
 
 def subtitle_png(text: str, out: Path):
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
-    lines = wrap_by_pixels(text, FONT, SUB_MAX_TEXT_W)
+    font, lines, size = fit_text(text, SUB_MAX_TEXT_W)
 
-    spacing = 14
-    line_h = FONT_SIZE + 10
-    tw = max(int(FONT.getlength(l)) for l in lines)
+    spacing = 12
+    line_h = size + 10
+    tw = max(int(font.getlength(l)) for l in lines)
     th = line_h * len(lines) + spacing * (len(lines) - 1)
 
-    pad_x, pad_y = 48, 30
-    box_w = min(tw + 2 * pad_x, W - 80)
+    pad_x, pad_y = 44, 28
+    box_w = min(tw + 2 * pad_x, W - 60)
     box_h = th + 2 * pad_y
 
     x1 = (W - box_w) // 2
@@ -157,13 +201,13 @@ def subtitle_png(text: str, out: Path):
 
     y = y1 + pad_y
     for line in lines:
-        lw = FONT.getlength(line)
+        lw = font.getlength(line)
         lx = (W - lw) // 2
         d.text(
             (lx, y),
             line,
             fill=(255, 255, 255, 255),
-            font=FONT,
+            font=font,
             stroke_width=3,
             stroke_fill=(0, 0, 0, 255),
         )
@@ -387,9 +431,9 @@ def build_reel(topic: str, scenes_list: List[Dict[str, str]], idx: int, cb=None)
         codec="libx264",
         audio_codec="aac",
         audio_bitrate="192k",
-        preset="medium",
+        preset="veryfast",  # "medium" is higher quality but too slow for a 2-core Codespace
         threads=os.cpu_count() or 2,
-        ffmpeg_params=["-crf", "19", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        ffmpeg_params=["-crf", "21", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
         logger=None,
     )
 
@@ -471,25 +515,60 @@ with col2:
                 vids.append(out)
                 status.write(f"✅ Done reel {i} in {int(time.time()-t0)}s")
 
-            st.success("All reels completed.")
+            st.success("All reels completed. Scroll down to 'Your Reels' to watch and download.")
 
-            for v in vids:
-                st.video(str(v))
-                st.download_button(
-                    f"Download {v.name}",
-                    v.read_bytes(),
-                    file_name=v.name,
-                    mime="video/mp4",
-                )
+# -------------------- PERSISTENT GALLERY --------------------
+# Rendered on EVERY run (not inside a button), so reels stay visible
+# after any click and even after restarting the app.
+st.divider()
+st.subheader("Your Reels")
 
-            if len(vids) > 1:
-                zip_path = VID / f"reels_{int(time.time())}.zip"
-                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                    for v in vids:
-                        z.write(v, arcname=v.name)
+_db = db_obj()
+_reels = sorted(_db["reels"].values(), key=lambda r: r.get("updated_at", 0), reverse=True)
+_existing = [r for r in _reels if Path(r.get("video_path", "")).exists()]
+
+if not _existing:
+    st.info("No reels built yet. Build one above and it will appear here.")
+else:
+    if len(_existing) > 1:
+        if st.button("Prepare ZIP of all reels"):
+            zip_path = VID / "all_reels.zip"
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                for r in _existing:
+                    p = Path(r["video_path"])
+                    z.write(p, arcname=p.name)
+            st.session_state["zip_ready"] = str(zip_path)
+        if st.session_state.get("zip_ready") and Path(st.session_state["zip_ready"]).exists():
+            zp = Path(st.session_state["zip_ready"])
+            with open(zp, "rb") as f:
                 st.download_button(
-                    "Download ALL as ZIP",
-                    zip_path.read_bytes(),
-                    file_name=zip_path.name,
+                    "⬇ Download ALL as ZIP",
+                    f,
+                    file_name=zp.name,
                     mime="application/zip",
+                    key="dl_zip_all",
                 )
+
+    for r in _existing:
+        p = Path(r["video_path"])
+        st.markdown(f"**{r['topic']}**")
+        # Pass the PATH, not bytes: Streamlit streams it with seek support,
+        # instead of shoving the whole file through the connection on every rerun.
+        st.video(str(p))
+
+        # Load file bytes for download ONLY when the user asks for this reel.
+        want_key = f"want_dl_{p.name}"
+        if st.session_state.get(want_key):
+            with open(p, "rb") as f:
+                st.download_button(
+                    f"⬇ Save {p.name} ({p.stat().st_size // (1024*1024)} MB)",
+                    f,
+                    file_name=p.name,
+                    mime="video/mp4",
+                    key=f"dl_{p.name}",
+                )
+        else:
+            if st.button(f"Prepare download for this reel", key=f"prep_{p.name}"):
+                st.session_state[want_key] = True
+                st.rerun()
+        st.divider()
