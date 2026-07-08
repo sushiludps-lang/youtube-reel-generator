@@ -1,4 +1,4 @@
-import json, time, re, os
+import json, time, re, os, asyncio
 from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Any
@@ -7,8 +7,11 @@ import zipfile
 import streamlit as st
 import requests
 import numpy as np
-from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+# Pillow >= 10 removed ANTIALIAS; moviepy 1.x still references it.
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.LANCZOS
 
 from moviepy.editor import (
     ImageClip,
@@ -25,12 +28,19 @@ from google.genai import types
 # -------------------- CONFIG --------------------
 W, H = 1080, 1920
 FPS = 30
-SCENE_SECONDS = 10
 IMAGES_PER_SCENE = 2
-IMAGE_SECONDS = SCENE_SECONDS / IMAGES_PER_SCENE
-CROSSFADE = 0.6
-FONT_SIZE = 84
+CROSSFADE = 0.5
+MIN_SCENE_SECONDS = 4.0        # floor so a very short line doesn't flash by
+MAX_SCENE_SECONDS = 14.0       # ceiling so one long line can't blow the pacing
 AUDIO_FPS = 44100
+
+FONT_SIZE = 62                 # 84 overflowed 1080px at 30-char wraps
+SUB_MAX_TEXT_W = W - 220       # pixel budget for a subtitle line
+SUB_BOTTOM_MARGIN = 340        # keep captions above the YouTube Shorts UI overlay
+
+# TTS voice (edge-tts neural voice; falls back to gTTS if unavailable)
+EDGE_VOICE = "en-US-ChristopherNeural"
+EDGE_RATE = "+8%"
 
 BASE = Path(__file__).parent
 IMG = BASE / "images"
@@ -74,81 +84,99 @@ def slug(t: str) -> str:
 def silence(d: float):
     return AudioClip(lambda t: np.zeros((1,), dtype=np.float32), duration=d, fps=AUDIO_FPS)
 
-def fit_audio(a: AudioFileClip, d: float):
-    if a.duration > d:
-        return a.subclip(0, d)
-    if a.duration < d:
-        return concatenate_audioclips([a, silence(d - a.duration)]).set_duration(d)
-    return a
-
-def get_font():
-    try:
-        return ImageFont.truetype("DejaVuSans-Bold.ttf", FONT_SIZE)
-    except Exception:
+def get_font(size: int = FONT_SIZE):
+    for p in (
+        "DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ):
         try:
-            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", FONT_SIZE)
+            return ImageFont.truetype(p, size)
         except Exception:
-            return ImageFont.load_default()
+            continue
+    return ImageFont.load_default()
 
 FONT = get_font()
 
-def subtitle_png(text: str, out: Path):
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+# -------------------- TTS --------------------
+def tts_save(text: str, out_path: Path):
+    """Neural voice via edge-tts; gTTS as fallback."""
+    text = (text or "").strip() or "..."
+    try:
+        import edge_tts
 
-    # wrap to 2 lines
+        async def _run():
+            await edge_tts.Communicate(text, EDGE_VOICE, rate=EDGE_RATE).save(str(out_path))
+
+        asyncio.run(_run())
+        if out_path.exists() and out_path.stat().st_size > 1000:
+            return
+    except Exception:
+        pass
+    from gtts import gTTS
+    gTTS(text).save(str(out_path))
+
+# -------------------- SUBTITLES --------------------
+def wrap_by_pixels(text: str, font, max_w: int, max_lines: int = 3) -> List[str]:
     words = (text or "").split()
     lines, cur = [], []
     for w in words:
         test = " ".join(cur + [w])
-        if len(test) <= 30:
+        if font.getlength(test) <= max_w or not cur:
             cur.append(w)
         else:
             lines.append(" ".join(cur))
             cur = [w]
     if cur:
         lines.append(" ".join(cur))
-    lines = lines[:2] or [""]
+    if len(lines) > max_lines:
+        # merge overflow into the last allowed line rather than dropping words
+        lines = lines[: max_lines - 1] + [" ".join(lines[max_lines - 1 :])]
+    return lines or [""]
 
-    # measure
-    spacing = 12
-    widths, heights = [], []
-    for line in lines:
-        bb = d.textbbox((0, 0), line, font=FONT)
-        widths.append(bb[2] - bb[0])
-        heights.append(bb[3] - bb[1])
+def subtitle_png(text: str, out: Path):
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
 
-    tw = max(widths) if widths else 0
-    th = sum(heights) + spacing * (len(lines) - 1)
+    lines = wrap_by_pixels(text, FONT, SUB_MAX_TEXT_W)
 
-    pad_x, pad_y = 60, 34
-    box_w = tw + 2 * pad_x
+    spacing = 14
+    line_h = FONT_SIZE + 10
+    tw = max(int(FONT.getlength(l)) for l in lines)
+    th = line_h * len(lines) + spacing * (len(lines) - 1)
+
+    pad_x, pad_y = 48, 30
+    box_w = min(tw + 2 * pad_x, W - 80)
     box_h = th + 2 * pad_y
 
     x1 = (W - box_w) // 2
-    y2 = H - 140
+    y2 = H - SUB_BOTTOM_MARGIN
     y1 = y2 - box_h
     x2 = x1 + box_w
 
-    # box
-    d.rounded_rectangle((x1, y1, x2, y2), radius=36, fill=(0, 0, 0, 200))
+    d.rounded_rectangle((x1, y1, x2, y2), radius=28, fill=(0, 0, 0, 170))
 
-    # centered text
     y = y1 + pad_y
-    for i, line in enumerate(lines):
-        bb = d.textbbox((0, 0), line, font=FONT)
-        lw = bb[2] - bb[0]
+    for line in lines:
+        lw = FONT.getlength(line)
         lx = (W - lw) // 2
-        d.text((lx, y), line, fill=(255, 255, 255, 255), font=FONT)
-        y += heights[i] + spacing
+        d.text(
+            (lx, y),
+            line,
+            fill=(255, 255, 255, 255),
+            font=FONT,
+            stroke_width=3,
+            stroke_fill=(0, 0, 0, 255),
+        )
+        y += line_h + spacing
 
     img.save(out)
 
+# -------------------- IMAGES --------------------
 def pexels(query: str, per_page: int = 15):
     r = requests.get(
         "https://api.pexels.com/v1/search",
         headers={"Authorization": PEXELS_KEY},
-        params={"query": query, "orientation": "portrait", "per_page": per_page},
+        params={"query": query, "orientation": "portrait", "per_page": per_page, "size": "large"},
         timeout=25,
     )
     r.raise_for_status()
@@ -158,15 +186,24 @@ def get_image(url: str, out: Path):
     r = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     img = Image.open(BytesIO(r.content)).convert("RGB")
-    img = ImageOps.fit(img, (W, H))
-    img.save(out, quality=90)
+    # fit slightly larger than frame so Ken Burns zoom never reveals edges
+    img = ImageOps.fit(img, (int(W * 1.15), int(H * 1.15)))
+    img.save(out, quality=92)
 
 def placeholder(out: Path, text: str):
-    im = Image.new("RGB", (W, H), (30, 30, 35))
+    im = Image.new("RGB", (int(W * 1.15), int(H * 1.15)), (24, 26, 32))
     d = ImageDraw.Draw(im)
     d.text((60, 80), "PLACEHOLDER", fill=(240, 240, 240), font=FONT)
-    d.text((60, 200), (text or "")[:120], fill=(240, 240, 240), font=FONT)
-    im.save(out, quality=90)
+    d.text((60, 200), (text or "")[:120], fill=(200, 200, 200), font=get_font(40))
+    im.save(out, quality=92)
+
+def ken_burns(img_path: Path, duration: float, zoom_in: bool = True) -> CompositeVideoClip:
+    """Slow zoom on a still image. Alternating direction keeps it from feeling mechanical."""
+    z0, z1 = (1.0, 1.10) if zoom_in else (1.10, 1.0)
+    base = ImageClip(str(img_path)).set_duration(duration)
+    dur = max(duration, 0.01)
+    clip = base.resize(lambda t: z0 + (z1 - z0) * (t / dur)).set_position("center")
+    return CompositeVideoClip([clip], size=(W, H)).set_duration(duration)
 
 # -------------------- JSON SAFE PARSE --------------------
 def parse_json_strict(raw: str) -> Dict[str, Any]:
@@ -178,7 +215,7 @@ def parse_json_strict(raw: str) -> Dict[str, Any]:
         s = raw.find("{")
         e = raw.rfind("}")
         if s != -1 and e != -1 and e > s:
-            return json.loads(raw[s:e+1])
+            return json.loads(raw[s : e + 1])
         raise
 
 # -------------------- GEMINI --------------------
@@ -189,7 +226,8 @@ Return ONLY valid JSON (no markdown, no commentary).
 
 Generate {n} unique YouTube Shorts science/curiosity topics.
 Rules:
-- Each is a short question (max 12 words).
+- Each is a short, punchy question (max 10 words) a viewer would stop scrolling for.
+- Prefer counterintuitive or "wait, really?" angles over textbook questions.
 - No repeats or near-repeats.
 - Do NOT include any of these existing topics:
 {list(existing)[:400]}
@@ -206,16 +244,13 @@ Format exactly:
     topics = []
     for t in data.get("topics", []):
         t = (t or "").strip()
-        if not t:
-            continue
-        if t.lower() in existing:
+        if not t or t.lower() in existing:
             continue
         topics.append(t)
         existing.add(t.lower())
         if len(topics) >= n:
             break
 
-    # update history
     hist = history_list()
     hist.extend([t.lower() for t in topics])
     hist = list(dict.fromkeys(hist))
@@ -226,15 +261,17 @@ def generate_script(topic: str, scenes: int) -> List[Dict[str, str]]:
     prompt = f"""
 Return ONLY valid JSON (no markdown, no commentary).
 
-Make a script for:
+Write a YouTube Shorts voiceover script for:
 Topic: "{topic}"
 
 Hard rules:
-- EXACTLY {scenes} scenes
-- Each scene spoken in ~10 seconds
-- Each scene object must have:
-  subtitle (1–2 sentences)
-  image_query (search phrase)
+- EXACTLY {scenes} scenes.
+- Scene 1 is a HOOK: open a curiosity gap in one bold sentence. No "welcome", no "today we".
+- Middle scenes each deliver ONE concrete fact or step that builds on the last.
+- Final scene is the PAYOFF: resolve the hook, then one short line inviting a follow/comment.
+- Each scene's subtitle is 16-24 spoken words (about 8-10 seconds of speech). Conversational, simple words.
+- image_query must be a CONCRETE visual phrase of 2-4 nouns a stock-photo site would have
+  (e.g. "lightning storm night sky", not "the physics of electricity").
 
 Format exactly:
 {{
@@ -259,25 +296,40 @@ Format exactly:
 
     cleaned = []
     for s in scenes_list:
-        cleaned.append({
-            "subtitle": str(s.get("subtitle", "")).strip() or "Here is the key idea in simple terms.",
-            "image_query": str(s.get("image_query", "")).strip() or topic
-        })
+        cleaned.append(
+            {
+                "subtitle": str(s.get("subtitle", "")).strip() or "Here is the key idea in simple terms.",
+                "image_query": str(s.get("image_query", "")).strip() or topic,
+            }
+        )
     return cleaned
 
 # -------------------- BUILD REEL --------------------
 def build_reel(topic: str, scenes_list: List[Dict[str, str]], idx: int, cb=None) -> Path:
     reel_id = f"reel{idx:02d}_{slug(topic)}_{int(time.time())}"
-    clips, auds = [], []
+    scene_clips = []
+    used_photo_ids = set()  # avoid the same stock photo appearing twice in one reel
 
     total = len(scenes_list)
     for si, sc in enumerate(scenes_list, 1):
         if cb:
-            cb((si-1)/max(1,total), f"Scene {si}/{total}: images + voice")
+            cb((si - 1) / max(1, total) * 0.8, f"Scene {si}/{total}: voice + images")
 
-        photos = []
+        # ---- voiceover first: it decides the scene length ----
+        mp3 = AUD / f"{reel_id}_scene_{si:02d}.mp3"
+        tts_save(sc["subtitle"], mp3)
+        voice = AudioFileClip(str(mp3))
+
+        # tail padding must exceed the crossfade so speech never bleeds into the next scene
+        scene_dur = voice.duration + CROSSFADE + 0.25
+        scene_dur = min(max(scene_dur, MIN_SCENE_SECONDS), MAX_SCENE_SECONDS)
+        if voice.duration > scene_dur - 0.1:
+            voice = voice.subclip(0, scene_dur - 0.1)
+        audio = concatenate_audioclips([voice, silence(scene_dur - voice.duration)]).set_duration(scene_dur)
+
+        # ---- images ----
         try:
-            photos = pexels(sc["image_query"], per_page=20)
+            photos = [p for p in pexels(sc["image_query"], per_page=20) if p.get("id") not in used_photo_ids]
         except Exception:
             photos = []
 
@@ -285,10 +337,12 @@ def build_reel(topic: str, scenes_list: List[Dict[str, str]], idx: int, cb=None)
         for j in range(IMAGES_PER_SCENE):
             out = IMG / f"{reel_id}_s{si:02d}_i{j+1:02d}.jpg"
             if j < len(photos):
-                url = photos[j].get("src", {}).get("portrait") or photos[j].get("src", {}).get("large2x")
+                p = photos[j]
+                url = p.get("src", {}).get("portrait") or p.get("src", {}).get("large2x")
                 try:
                     if url:
                         get_image(url, out)
+                        used_photo_ids.add(p.get("id"))
                     else:
                         placeholder(out, f"{topic} / scene {si}")
                 except Exception:
@@ -297,51 +351,45 @@ def build_reel(topic: str, scenes_list: List[Dict[str, str]], idx: int, cb=None)
                 placeholder(out, f"{topic} / scene {si}")
             img_paths.append(out)
 
-        # 2 images with crossfade inside scene
-        c1 = ImageClip(str(img_paths[0])).set_duration(IMAGE_SECONDS)
-        c2 = ImageClip(str(img_paths[1])).set_duration(IMAGE_SECONDS).crossfadein(CROSSFADE)
-        scene_vid = concatenate_videoclips([c1, c2], method="compose", padding=-CROSSFADE).set_duration(SCENE_SECONDS)
+        # two images per scene, alternating zoom direction, crossfaded
+        half = (scene_dur + CROSSFADE) / 2
+        c1 = ken_burns(img_paths[0], half, zoom_in=(si % 2 == 1))
+        c2 = ken_burns(img_paths[1], half, zoom_in=(si % 2 == 0)).crossfadein(CROSSFADE)
+        scene_vid = concatenate_videoclips([c1, c2], method="compose", padding=-CROSSFADE).set_duration(scene_dur)
 
         # subtitle overlay
         sub_path = IMG / f"{reel_id}_sub_{si:02d}.png"
         subtitle_png(sc["subtitle"], sub_path)
-        sub = ImageClip(str(sub_path)).set_duration(SCENE_SECONDS)
+        sub = ImageClip(str(sub_path)).set_duration(scene_dur)
 
-        composed = CompositeVideoClip([scene_vid, sub], size=(W, H)).set_duration(SCENE_SECONDS)
-
-        # per-scene audio exactly 10s
-        mp3 = AUD / f"{reel_id}_scene_{si:02d}.mp3"
-        gTTS(sc["subtitle"]).save(str(mp3))
-        a = fit_audio(AudioFileClip(str(mp3)), SCENE_SECONDS)
-
-        composed = composed.set_audio(a)
-        clips.append(composed)
-        auds.append(a)
+        composed = (
+            CompositeVideoClip([scene_vid, sub], size=(W, H))
+            .set_duration(scene_dur)
+            .set_audio(audio)
+        )
+        scene_clips.append(composed)
 
     if cb:
         cb(0.85, "Stitching scenes...")
 
-    # crossfade between scenes
-    for k in range(1, len(clips)):
-        clips[k] = clips[k].crossfadein(CROSSFADE)
-
-    video = concatenate_videoclips(clips, method="compose", padding=-CROSSFADE)
-    audio = concatenate_audioclips(auds).set_duration(len(scenes_list) * SCENE_SECONDS)
-    video = video.set_audio(audio).set_duration(len(scenes_list) * SCENE_SECONDS)
+    # crossfade between scenes; audio rides inside each clip so sync is preserved.
+    for k in range(1, len(scene_clips)):
+        scene_clips[k] = scene_clips[k].crossfadein(CROSSFADE)
+    video = concatenate_videoclips(scene_clips, method="compose", padding=-CROSSFADE)
 
     out = VID / f"{reel_id}.mp4"
-
     if cb:
-        cb(0.92, "Exporting MP4...")
+        cb(0.9, "Exporting MP4 (this is the slow part)...")
 
     video.write_videofile(
         str(out),
         fps=FPS,
         codec="libx264",
         audio_codec="aac",
-        preset="ultrafast",
-        threads=2,
-        ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        audio_bitrate="192k",
+        preset="medium",
+        threads=os.cpu_count() or 2,
+        ffmpeg_params=["-crf", "19", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
         logger=None,
     )
 
@@ -352,7 +400,6 @@ def build_reel(topic: str, scenes_list: List[Dict[str, str]], idx: int, cb=None)
         video.close()
     except Exception:
         pass
-
     return out
 
 # -------------------- UI --------------------
@@ -369,8 +416,8 @@ if "selected" not in st.session_state:
 with col1:
     st.subheader("1) Topics")
     how_many = st.slider("How many new topics?", 1, 20, 10)
-    scenes_n = st.selectbox("Scenes per reel", [6, 8], index=0)
-    st.caption(f"{scenes_n} scenes × {SCENE_SECONDS}s = ~{scenes_n*SCENE_SECONDS}s reel. (2 images/scene)")
+    scenes_n = st.selectbox("Scenes per reel", [5, 6, 8], index=1)
+    st.caption(f"Scene length now follows the voiceover (~8-12s each), so {scenes_n} scenes ≈ {scenes_n*10}s.")
 
     if st.button("Generate Topics"):
         with st.spinner("Generating topics..."):
@@ -401,9 +448,9 @@ with col2:
                 status.write(f"Reel {i}/{len(build_list)}: {tp}")
 
                 def cb(p, msg):
-                    overall.progress((i-1 + p) / len(build_list))
+                    overall.progress((i - 1 + p) / len(build_list))
                     elapsed = time.time() - start_all
-                    done_frac = (i-1 + p) / len(build_list)
+                    done_frac = (i - 1 + p) / len(build_list)
                     if done_frac > 0:
                         remaining = (elapsed / done_frac) - elapsed
                         eta.write(f"ETA ~ {int(max(0, remaining))}s")
@@ -412,10 +459,8 @@ with col2:
                 scenes_list = generate_script(tp, scenes_n)
                 out = build_reel(tp, scenes_list, i, cb=cb)
 
-                # Save to DB
                 db = db_obj()
-                key = tp.lower()
-                db["reels"][key] = {
+                db["reels"][tp.lower()] = {
                     "topic": tp,
                     "scenes": scenes_list,
                     "video_path": str(out),
@@ -428,12 +473,11 @@ with col2:
 
             st.success("All reels completed.")
 
-            # show + download
             for v in vids:
                 st.video(str(v))
                 st.download_button(
                     f"Download {v.name}",
-                    open(v, "rb"),
+                    v.read_bytes(),
                     file_name=v.name,
                     mime="video/mp4",
                 )
@@ -445,7 +489,7 @@ with col2:
                         z.write(v, arcname=v.name)
                 st.download_button(
                     "Download ALL as ZIP",
-                    open(zip_path, "rb"),
+                    zip_path.read_bytes(),
                     file_name=zip_path.name,
                     mime="application/zip",
                 )
